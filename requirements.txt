@@ -1,0 +1,8 @@
+langgraph
+langchain
+langchain-community
+pandas
+matplotlib
+seaborn
+jupyter
+tqdm

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/
+*.jsonl
+
+# Logs and OS files
+logs/
+.DS_Storevenv/
+sandbox/
+*.log
+logs/
+__pycache__/
