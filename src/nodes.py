@@ -109,7 +109,6 @@ def injection_node(state: AgentState) -> Dict:
         return {"is_compiled": (result.returncode == 0)}
     except:
         return {"is_compiled": False}
-
 def mutation_node(state: AgentState) -> Dict:
     if not state.get("is_compiled"): 
         return {"mutation_score": 0.0, "compile_time": 0.0}
@@ -123,7 +122,7 @@ def mutation_node(state: AgentState) -> Dict:
     if pit_reports_path.exists():
         shutil.rmtree(pit_reports_path)
 
-    target_tests, target_classes = "*" , "*"
+    target_tests, target_classes = "*", "*"
     if file_path:
         parts = str(file_path).replace("\\", "/").split("src/test/java/")
         if len(parts) > 1:
@@ -136,11 +135,11 @@ def mutation_node(state: AgentState) -> Dict:
             if class_name.endswith("Test"): class_name = class_name[:-4]
             target_classes = ".".join(pkg_parts[:-1]) + "." + class_name if len(pkg_parts) > 1 else class_name
 
-    cmd = [
-        "mvn", "test-compile", "org.pitest:pitest-maven:mutationCoverage",
+    # --- STEP 1: Verify Test Compiles and Passes (Standard Run) ---
+    cmd_verify = [
+        "mvn", "test",
         "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
-        f"-DtargetClasses={target_classes}", f"-DtargetTests={target_tests}",
-        "-Dmutators=ALL", "-DoutputFormats=CSV"
+        f"-Dtest={target_tests}"
     ]
 
     try:
@@ -148,14 +147,31 @@ def mutation_node(state: AgentState) -> Dict:
         env["JAVA_HOME"] = str(JAVA_HOME)
         
         start_time = time.time()
-        result = subprocess.run(cmd, cwd=str(repo_path), capture_output=True, text=True, env=env, timeout=1200)
-        compile_time = time.time() - start_time
-
-        if "unreported exception" in result.stdout:
+        
+        verify_result = subprocess.run(cmd_verify, cwd=str(repo_path), capture_output=True, text=True, env=env, timeout=600)
+        
+        # If compilation fails OR the test assertion fails (Red Test), quarantine it immediately
+        if verify_result.returncode != 0:
+            compile_time = time.time() - start_time
             return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time}
 
-        match = re.search(r"Generated\s+(\d+)\s+mutations\s+Killed\s+\d+\s+\((\d+)%\)", result.stdout)
+        # --- STEP 2: Run PITest Mutation Coverage (Only if Step 1 Passed) ---
+        cmd_mutate = [
+            "mvn", "test-compile", "org.pitest:pitest-maven:mutationCoverage",
+            "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+            f"-DtargetClasses={target_classes}", f"-DtargetTests={target_tests}",
+            "-Dmutators=ALL", "-DoutputFormats=CSV"
+        ]
+
+        mutate_result = subprocess.run(cmd_mutate, cwd=str(repo_path), capture_output=True, text=True, env=env, timeout=1200)
+        compile_time = time.time() - start_time
+
+        if "unreported exception" in mutate_result.stdout or "COMPILATION ERROR" in mutate_result.stdout:
+            return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time}
+
+        match = re.search(r"Generated\s+(\d+)\s+mutations\s+Killed\s+\d+\s+\((\d+)%\)", mutate_result.stdout)
         score = float(match.group(2)) / 100.0 if match and int(match.group(1)) > 0 else 0.0
         return {"mutation_score": score, "compile_time": compile_time}
-    except:
+        
+    except Exception as e:
         return {"mutation_score": 0.0, "compile_time": 0.0}
