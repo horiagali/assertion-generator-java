@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import shutil
 import subprocess
 import time
@@ -109,9 +110,10 @@ def injection_node(state: AgentState) -> Dict:
         return {"is_compiled": (result.returncode == 0)}
     except:
         return {"is_compiled": False}
+
 def mutation_node(state: AgentState) -> Dict:
     if not state.get("is_compiled"): 
-        return {"mutation_score": 0.0, "compile_time": 0.0}
+        return {"mutation_score": 0.0, "compile_time": 0.0, "critic_feedback": "[COMPILATION FAILED] Ensure all variables are declared and the code compiles."}
 
     project_name = state.get("project_name")
     repo_path = CLONED_REPOS_DIR / str(project_name)
@@ -153,25 +155,92 @@ def mutation_node(state: AgentState) -> Dict:
         # If compilation fails OR the test assertion fails (Red Test), quarantine it immediately
         if verify_result.returncode != 0:
             compile_time = time.time() - start_time
-            return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time}
+            return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time, "critic_feedback": "[TEST FAILED] The injected assertions caused the test suite to fail or throw an exception."}
 
-        # --- STEP 2: Run PITest Mutation Coverage (Only if Step 1 Passed) ---
+        # --- STEP 2: Run PITest Mutation Coverage ---
         cmd_mutate = [
             "mvn", "test-compile", "org.pitest:pitest-maven:mutationCoverage",
             "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
             f"-DtargetClasses={target_classes}", f"-DtargetTests={target_tests}",
-            "-Dmutators=ALL", "-DoutputFormats=CSV"
+            "-Dmutators=ALL", 
+            "-DoutputFormats=CSV", 
+            "-DtimestampedReports=false" # Forces output to target/pit-reports/mutations.csv directly
         ]
 
         mutate_result = subprocess.run(cmd_mutate, cwd=str(repo_path), capture_output=True, text=True, env=env, timeout=1200)
         compile_time = time.time() - start_time
 
         if "unreported exception" in mutate_result.stdout or "COMPILATION ERROR" in mutate_result.stdout:
-            return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time}
+            return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time, "critic_feedback": "[COMPILATION ERROR DURING PIT]"}
 
-        match = re.search(r"Generated\s+(\d+)\s+mutations\s+Killed\s+\d+\s+\((\d+)%\)", mutate_result.stdout)
-        score = float(match.group(2)) / 100.0 if match and int(match.group(1)) > 0 else 0.0
-        return {"mutation_score": score, "compile_time": compile_time}
+        # --- STEP 3: Extract Test Strength and Critic Feedback from CSV ---
+        pit_csv_path = repo_path / "target" / "pit-reports" / "mutations.csv"
+        
+        test_strength = 0.0
+        critic_details = ""
+        
+        if pit_csv_path.exists():
+            with open(pit_csv_path, 'r', encoding='utf-8') as csvfile:
+                reader = csv.reader(csvfile)
+                generated = 0
+                killed = 0
+                no_coverage = 0
+                
+                survived_list = []
+                no_cov_methods = set()
+                
+                # PIT CSV format: filename, class, mutator, method, line, status, killing_test
+                for row in reader:
+                    if len(row) >= 6:
+                        generated += 1
+                        mutator = row[2].split('.')[-1]
+                        method = row[3]
+                        line = row[4]
+                        status = row[5].strip()
+                        
+                        if status == 'NO_COVERAGE':
+                            no_coverage += 1
+                            no_cov_methods.add(method)
+                        elif status in ['KILLED', 'TIMED_OUT', 'MEMORY_ERROR']:
+                            killed += 1
+                        elif status == 'SURVIVED':
+                            survived_list.append(f"Line {line} ({method}): {mutator} survived")
+                
+                covered = generated - no_coverage
+                
+                if covered > 0:
+                    test_strength = killed / covered
+                else:
+                    test_strength = 0.0
+                
+                # Format the Critic Feedback String
+                detail_parts = []
+                if survived_list:
+                    survived_str = "\n".join(survived_list[:10])
+                    if len(survived_list) > 10:
+                        survived_str += f"\n...and {len(survived_list) - 10} more."
+                    detail_parts.append(f"[MUTATIONS SURVIVED] Test Strength: {test_strength:.2f}. Failed to kill:\n{survived_str}")
+                    
+                if no_cov_methods:
+                    detail_parts.append(f"NO_COVERAGE (You are not calling these methods): {', '.join(no_cov_methods)}")
+                
+                if detail_parts:
+                    critic_details = "\n".join(detail_parts)
+                else:
+                    critic_details = "[GOAL ACHIEVED] 100% Test Strength! Excellent assertions."
+        else:
+            # Fallback if CSV is missing
+            match_strength = re.search(r"Test strength\s+(\d+)%", mutate_result.stdout)
+            if match_strength:
+                test_strength = float(match_strength.group(1)) / 100.0
+            critic_details = "CSV report not found. Fallback to console score parsing."
+
+        # We keep the key as "mutation_score" so main.py doesn't break, but its value is now Test Strength
+        return {
+            "mutation_score": test_strength, 
+            "compile_time": compile_time, 
+            "critic_feedback": critic_details
+        }
         
     except Exception as e:
-        return {"mutation_score": 0.0, "compile_time": 0.0}
+        return {"mutation_score": 0.0, "compile_time": 0.0, "critic_feedback": f"Error parsing PIT results: {str(e)}"}

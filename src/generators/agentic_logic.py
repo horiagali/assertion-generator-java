@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import subprocess
 import shutil
 from pathlib import Path
@@ -101,7 +102,7 @@ def execute_sandbox(state: AgentState) -> Dict:
         "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
         f"-DtargetClasses={target_classes}",
         f"-DtargetTests={target_tests}",
-        "-Dmutators=ALL", "-DoutputFormats=CSV"
+        "-Dmutators=ALL", "-DoutputFormats=CSV", "-DtimestampedReports=false"
     ]
     
     mvn_res = subprocess.run(cmd_mvn, cwd=str(repo_path), env=env, capture_output=True, text=True, timeout=1200)
@@ -110,11 +111,7 @@ def execute_sandbox(state: AgentState) -> Dict:
     if "Compilation failure" in stdout or "cannot find symbol" in stdout:
         return {"is_compiled": False, "stdout": stdout, "score": 0.0, "csv_path": None}
         
-    score = 0.0
-    match = re.search(r"Generated\s+\d+\s+mutations\s+Killed\s+\d+\s+\((\d+)%\)", stdout)
-    if match:
-        score = float(match.group(1)) / 100.0
-        
+    # Find CSV path
     mutations_csv_path = None
     target_dir = repo_path / "target" / "pit-reports"
     if target_dir.exists():
@@ -122,6 +119,33 @@ def execute_sandbox(state: AgentState) -> Dict:
             if "mutations.csv" in files:
                 mutations_csv_path = Path(root) / "mutations.csv"
                 break
+
+    # Calculate Test Strength
+    score = 0.0
+    if mutations_csv_path:
+        with open(mutations_csv_path, 'r', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            generated = 0
+            killed = 0
+            no_coverage = 0
+            
+            for row in reader:
+                if len(row) >= 6:
+                    generated += 1
+                    status = row[5].strip()
+                    if status == 'NO_COVERAGE':
+                        no_coverage += 1
+                    elif status in ['KILLED', 'TIMED_OUT', 'MEMORY_ERROR']:
+                        killed += 1
+            
+            covered = generated - no_coverage
+            if covered > 0:
+                score = killed / covered
+    else:
+        # Fallback parsing Test Strength from console if CSV fails
+        match_strength = re.search(r"Test strength\s+(\d+)%", stdout)
+        if match_strength:
+            score = float(match_strength.group(1)) / 100.0
                 
     return {"is_compiled": True, "stdout": stdout, "score": score, "csv_path": mutations_csv_path}
 
@@ -200,9 +224,9 @@ def critic_node(state: AgentState) -> Dict:
         # Use explicit status codes instead of the word 'SUCCESS' to avoid route confusion
         if score < 1.0:
             csv_feedback = parse_pitest_csv(result["csv_path"]) if result["csv_path"] else "No CSV details."
-            feedback = f"[MUTATIONS SURVIVED] Score: {score}. Details: {csv_feedback}"
+            feedback = f"[MUTATIONS SURVIVED] Test Strength: {score:.2f}. Details: {csv_feedback}"
         else:
-            feedback = "[GOAL ACHIEVED] 100% Mutation Coverage."
+            feedback = "[GOAL ACHIEVED] 100% Test Strength."
 
     print(f"         [CRITIC FEEDBACK]: {feedback}")
     print(f"      >> [AGENT] Iteration {current_iter + 1} Result: {score * 100:.1f}%")
@@ -210,7 +234,7 @@ def critic_node(state: AgentState) -> Dict:
     best_score = state.get("best_score", 0.0)
     best_pred = state.get("best_prediction", "")
     history = state.get("feedback_history", [])
-    history.append(f"Attempt {current_iter + 1}: Score {score}. Feedback: {feedback}")
+    history.append(f"Attempt {current_iter + 1}: Score {score:.2f}. Feedback: {feedback}")
     
     if score > best_score:
         new_best_score = score
