@@ -34,9 +34,12 @@ def find_project_root(base_dir, project_keyword):
 
 def run_evaluation(config, json_files, limit=None):
     """Helper to run a specific configuration and return metrics."""
-    total_score = 0.0
+    total_test_strength = 0.0
     total_time = 0.0
-    count = 0
+    
+    processed_count = 0
+    completed_runs = 0
+    quarantined_runs = 0
 
     # Cache setup
     cache_file = DATA_PROJECT_DIR / "scripts" / "dataset" / "output" / "compilation_cache.json"
@@ -46,13 +49,13 @@ def run_evaluation(config, json_files, limit=None):
             compile_cache = json.load(f)
 
     for dataset_path in json_files:
-        if limit and count >= limit: break
+        if limit and processed_count >= limit: break
         with open(dataset_path, "r", encoding="utf-8") as f:    
             raw_data = json.load(f)
         project_objs = raw_data if isinstance(raw_data, list) else [raw_data]
         
         for project_obj in project_objs:
-            if limit and count >= limit: break
+            if limit and processed_count >= limit: break
             
             package_id = project_obj.get("testClass", {}).get("packageIdentifier", "")
             if "twilio" in str(package_id).lower(): keyword = "twilio-java"
@@ -68,7 +71,12 @@ def run_evaluation(config, json_files, limit=None):
             parent_focal_class = project_obj.get("focalClass", {})
 
             for dp in project_obj.get("datapoints", []):
-                if limit and count >= limit: break
+                if limit and processed_count >= limit: break
+
+                # --- TEMPORARY SKIP: Remove or comment out to run all tests ---
+                if processed_count < 7:
+                    processed_count += 1
+                    continue
                 
                 item_id = str(dp.get("testPrefix", {}).get("identifier", "UNKNOWN"))
 
@@ -113,15 +121,27 @@ def run_evaluation(config, json_files, limit=None):
                     with open(cache_file, "w", encoding="utf-8") as f:
                         json.dump(compile_cache, f, indent=4)
 
-                score = final.get("mutation_score", 0.0) if final.get("mutation_score") else 0.0
-                total_score += score
+                # --- METRICS & PRINTING ---
+                processed_count += 1
                 total_time += dur
-                count += 1
                 
-                status = "QUARANTINED" if final.get("is_quarantined") else f"Score: {score:.4f}"
-                print(f"    [{count}] {item_id} | {status} | Time: {dur:.2f}s")
+                is_quarantined = final.get("is_quarantined", False)
+                score = final.get("mutation_score", 0.0) if final.get("mutation_score") else 0.0
+                
+                if is_quarantined:
+                    quarantined_runs += 1
+                    print(f"    [{processed_count}] {item_id} | QUARANTINED | Time: {dur:.2f}s")
+                else:
+                    completed_runs += 1
+                    total_test_strength += score
+                    running_avg = total_test_strength / completed_runs
+                    
+                    print(f"    [{processed_count}] {item_id} | Test Strength: {score:.4f} | Running Avg: {running_avg:.4f} | Time: {dur:.2f}s")
 
-    return (total_score / count if count > 0 else 0, total_time / count if count > 0 else 0, count)
+    final_avg = (total_test_strength / completed_runs) if completed_runs > 0 else 0.0
+    avg_time = (total_time / processed_count) if processed_count > 0 else 0.0
+    
+    return final_avg, avg_time, completed_runs
 
 def main():
     parser = argparse.ArgumentParser(description="LLM Test Evaluator")
@@ -141,12 +161,12 @@ def main():
         results = {}
         for v in variants:
             print(f"\n>>> RUNNING ABLATION: {v['name']}")
-            avg_s, avg_t, _ = run_evaluation(v, json_files, args.limit)
-            results[v['name']] = (avg_s, avg_t)
+            avg_s, avg_t, completed = run_evaluation(v, json_files, args.limit)
+            results[v['name']] = (avg_s, avg_t, completed)
 
-        print("\n" + "="*50 + "\n FINAL ABLATION RESULTS \n" + "="*50)
+        print("\n" + "="*60 + "\n FINAL ABLATION RESULTS (TEST STRENGTH) \n" + "="*60)
         for name, metrics in results.items():
-            print(f"{name:<20} | Score: {metrics[0]:.4f} | Time: {metrics[1]:.2f}s")
+            print(f"{name:<20} | Avg Test Strength: {metrics[0]:.4f} | Valid Runs: {metrics[2]} | Avg Time: {metrics[1]:.2f}s")
     
     else:
         # Standard Single Run
@@ -157,8 +177,8 @@ def main():
             "loop": (args.mode == "agentic")
         }
         print(f"\n>>> STARTING BATCH RUN | MODE: {args.mode.upper()}")
-        avg_s, avg_t, total = run_evaluation(config, json_files, args.limit)
-        print(f"\nDONE. Avg Score: {avg_s:.4f} | Avg Time: {avg_t:.2f}s | Total: {total}")
+        avg_s, avg_t, completed = run_evaluation(config, json_files, args.limit)
+        print(f"\nDONE. Final Avg Test Strength: {avg_s:.4f} | Valid Runs: {completed} | Avg Time: {avg_t:.2f}s")
 
 if __name__ == "__main__":
     main()

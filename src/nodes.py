@@ -19,11 +19,9 @@ from generators.human_logic import run_human_logic
 def data_loader_node(state: AgentState) -> Dict:
     dp = state.get("raw_datapoint")
     test_prefix = dp.get("testPrefix", {})
-    
-    # Look for the flattened key we just created
     focal_info = dp.get("_focalClass", {})
     
-    # Extract method bodies from the structured list
+    # Extract method bodies
     method_codes = []
     for method in focal_info.get("methods", []):
         m_body = method.get("body")
@@ -31,15 +29,26 @@ def data_loader_node(state: AgentState) -> Dict:
             method_codes.append(m_body)
     
     focal_code = "\n\n".join(method_codes)
-    
-    # DEBUG: This should now show a number > 0
-    print(f"      [DEBUG] Found {len(method_codes)} methods. Combined Length: {len(focal_code)}")
-    
+    test_stub = test_prefix.get('body', '')
+    method_sig = test_prefix.get("signature")
+
+    # --- NEW PRINT STATEMENTS FOR VISIBILITY ---
+    print("\n" + "="*80)
+    print(f"TARGET METHOD: {method_sig}")
+    print("-" * 80)
+    print("### FOCAL CLASS IMPLEMENTATION ###")
+    print(focal_code if focal_code else "NO IMPLEMENTATION FOUND")
+    print("-" * 80)
+    print("### TEST FILE CONTEXT (STUB) ###")
+    print(test_stub)
+    print("="*80 + "\n")
+    # --------------------------------------------
+
     combined_context = (
         "### FOCAL CLASS IMPLEMENTATION ###\n"
         f"{focal_code if focal_code else 'NO IMPLEMENTATION FOUND'}\n\n"
         "### TEST FILE CONTEXT (STUB) ###\n"
-        f"{test_prefix.get('body', '')}"
+        f"{test_stub}"
     )
     
     return {
@@ -49,7 +58,7 @@ def data_loader_node(state: AgentState) -> Dict:
         "prompt_context": combined_context,
         "ground_truth": dp.get("target"),
         "file_path": dp.get("_test_file_path"),
-        "method_signature": test_prefix.get("signature")
+        "method_signature": method_sig
     }
 
 def generation_node(state: AgentState) -> Dict:
@@ -110,7 +119,6 @@ def injection_node(state: AgentState) -> Dict:
         return {"is_compiled": (result.returncode == 0)}
     except:
         return {"is_compiled": False}
-
 def mutation_node(state: AgentState) -> Dict:
     if not state.get("is_compiled"): 
         return {"mutation_score": 0.0, "compile_time": 0.0, "critic_feedback": "[COMPILATION FAILED] Ensure all variables are declared and the code compiles."}
@@ -137,7 +145,7 @@ def mutation_node(state: AgentState) -> Dict:
             if class_name.endswith("Test"): class_name = class_name[:-4]
             target_classes = ".".join(pkg_parts[:-1]) + "." + class_name if len(pkg_parts) > 1 else class_name
 
-    # --- STEP 1: Verify Test Compiles and Passes (Standard Run) ---
+    # --- STEP 1: Verify Test Compiles and Passes ---
     cmd_verify = [
         "mvn", "test",
         "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
@@ -147,12 +155,10 @@ def mutation_node(state: AgentState) -> Dict:
     try:
         env = os.environ.copy()
         env["JAVA_HOME"] = str(JAVA_HOME)
-        
         start_time = time.time()
         
         verify_result = subprocess.run(cmd_verify, cwd=str(repo_path), capture_output=True, text=True, env=env, timeout=600)
         
-        # If compilation fails OR the test assertion fails (Red Test), quarantine it immediately
         if verify_result.returncode != 0:
             compile_time = time.time() - start_time
             return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time, "critic_feedback": "[TEST FAILED] The injected assertions caused the test suite to fail or throw an exception."}
@@ -164,7 +170,7 @@ def mutation_node(state: AgentState) -> Dict:
             f"-DtargetClasses={target_classes}", f"-DtargetTests={target_tests}",
             "-Dmutators=ALL", 
             "-DoutputFormats=CSV", 
-            "-DtimestampedReports=false" # Forces output to target/pit-reports/mutations.csv directly
+            "-DtimestampedReports=false"
         ]
 
         mutate_result = subprocess.run(cmd_mutate, cwd=str(repo_path), capture_output=True, text=True, env=env, timeout=1200)
@@ -173,7 +179,7 @@ def mutation_node(state: AgentState) -> Dict:
         if "unreported exception" in mutate_result.stdout or "COMPILATION ERROR" in mutate_result.stdout:
             return {"mutation_score": None, "is_quarantined": True, "compile_time": compile_time, "critic_feedback": "[COMPILATION ERROR DURING PIT]"}
 
-        # --- STEP 3: Extract Test Strength and Critic Feedback from CSV ---
+        # --- STEP 3: Extract Test Strength and Filtered Critic Feedback ---
         pit_csv_path = repo_path / "target" / "pit-reports" / "mutations.csv"
         
         test_strength = 0.0
@@ -185,11 +191,8 @@ def mutation_node(state: AgentState) -> Dict:
                 generated = 0
                 killed = 0
                 no_coverage = 0
-                
                 survived_list = []
-                no_cov_methods = set()
                 
-                # PIT CSV format: filename, class, mutator, method, line, status, killing_test
                 for row in reader:
                     if len(row) >= 6:
                         generated += 1
@@ -200,42 +203,30 @@ def mutation_node(state: AgentState) -> Dict:
                         
                         if status == 'NO_COVERAGE':
                             no_coverage += 1
-                            no_cov_methods.add(method)
+                            # Silently ignore NO_COVERAGE for feedback purposes
                         elif status in ['KILLED', 'TIMED_OUT', 'MEMORY_ERROR']:
                             killed += 1
                         elif status == 'SURVIVED':
+                            # We only notify the agent about mutants on lines it ACTUALLY reached
                             survived_list.append(f"Line {line} ({method}): {mutator} survived")
                 
                 covered = generated - no_coverage
+                test_strength = (killed / covered) if covered > 0 else 0.0
                 
-                if covered > 0:
-                    test_strength = killed / covered
-                else:
-                    test_strength = 0.0
-                
-                # Format the Critic Feedback String
-                detail_parts = []
                 if survived_list:
-                    survived_str = "\n".join(survived_list[:10])
-                    if len(survived_list) > 10:
-                        survived_str += f"\n...and {len(survived_list) - 10} more."
-                    detail_parts.append(f"[MUTATIONS SURVIVED] Test Strength: {test_strength:.2f}. Failed to kill:\n{survived_str}")
-                    
-                if no_cov_methods:
-                    detail_parts.append(f"NO_COVERAGE (You are not calling these methods): {', '.join(no_cov_methods)}")
-                
-                if detail_parts:
-                    critic_details = "\n".join(detail_parts)
+                    # Provide feedback ONLY on survived mutants (the ones the agent can fix)
+                    survived_str = "\n".join(survived_list[:15])
+                    if len(survived_list) > 15:
+                        survived_str += f"\n...and {len(survived_list) - 15} more."
+                    critic_details = f"[MUTATIONS SURVIVED] Your assertions reached the code but failed to distinguish the mutant from the original. Strengthen your assertions for:\n{survived_str}"
                 else:
-                    critic_details = "[GOAL ACHIEVED] 100% Test Strength! Excellent assertions."
+                    critic_details = f"[GOAL ACHIEVED] 100% Test Strength for covered lines ({covered}/{generated} mutants covered)."
         else:
-            # Fallback if CSV is missing
+            # Fallback
             match_strength = re.search(r"Test strength\s+(\d+)%", mutate_result.stdout)
-            if match_strength:
-                test_strength = float(match_strength.group(1)) / 100.0
-            critic_details = "CSV report not found. Fallback to console score parsing."
+            test_strength = (float(match_strength.group(1)) / 100.0) if match_strength else 0.0
+            critic_details = "CSV report not found. Use better values in assertions to improve coverage score."
 
-        # We keep the key as "mutation_score" so main.py doesn't break, but its value is now Test Strength
         return {
             "mutation_score": test_strength, 
             "compile_time": compile_time, 
@@ -243,4 +234,4 @@ def mutation_node(state: AgentState) -> Dict:
         }
         
     except Exception as e:
-        return {"mutation_score": 0.0, "compile_time": 0.0, "critic_feedback": f"Error parsing PIT results: {str(e)}"}
+        return {"mutation_score": 0.0, "compile_time": 0.0, "critic_feedback": f"Error: {str(e)}"}
