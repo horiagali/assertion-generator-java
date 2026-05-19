@@ -2,6 +2,7 @@ import os
 import json
 import time
 import argparse
+
 from pathlib import Path
 from langgraph.graph import StateGraph, END
 
@@ -47,48 +48,14 @@ def find_project_root(base_dir, project_keyword):
     project_keyword = project_keyword.lower()
 
     for root, dirs, files in os.walk(base_dir):
+
         for d in dirs:
+
             if d.lower() == project_keyword:
                 return Path(root) / d
 
     return None
 
-
-def should_skip_async_test(datapoint):
-    """
-    Skip async tests that require checked exception handling.
-
-    These generated STAR split tests often contain:
-        future.get()
-
-    without:
-        throws Exception
-    or:
-        try/catch
-
-    which causes Maven compilation failures unrelated to
-    assertion generation quality.
-    """
-
-    test_method = str(
-        datapoint.get("testMethod", "")
-    )
-
-    test_prefix = str(
-        datapoint.get("testPrefix", {}).get("identifier", "")
-    )
-
-    combined = f"{test_method}\n{test_prefix}"
-
-    async_patterns = [
-        "future.get(",
-        "CompletableFuture",
-        "patchAsync",
-        "InterruptedException",
-        "ExecutionException"
-    ]
-
-    return any(pattern in combined for pattern in async_patterns)
 
 
 def is_valid_generated_assertion(assertion_text):
@@ -110,6 +77,7 @@ def is_valid_generated_assertion(assertion_text):
     ]
 
     for pattern in invalid_patterns:
+
         if pattern in cleaned:
             return False
 
@@ -126,34 +94,48 @@ def run_evaluation(config, json_files, limit=None):
     """
 
     total_test_strength = 0.0
+    total_mutation_score = 0.0
     total_time = 0.0
 
     processed_count = 0
     completed_runs = 0
-    quarantined_runs = 0
-    skipped_async = 0
+
+    skipped_broken = 0
     skipped_invalid = 0
 
-    cache_file = (
+
+
+    broken_file = (
         DATA_PROJECT_DIR
         / "scripts"
         / "dataset"
         / "output"
-        / "compilation_cache.json"
+        / "broken_tests.json"
     )
 
-    compile_cache = {}
+    broken_tests = {}
 
-    if cache_file.exists():
-        with open(cache_file, "r", encoding="utf-8") as f:
-            compile_cache = json.load(f)
+    if broken_file.exists():
+
+        with open(
+            broken_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            broken_tests = json.load(f)
 
     for dataset_path in json_files:
 
         if limit and processed_count >= limit:
             break
 
-        with open(dataset_path, "r", encoding="utf-8") as f:
+        with open(
+            dataset_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             raw_data = json.load(f)
 
         project_objs = (
@@ -175,7 +157,9 @@ def run_evaluation(config, json_files, limit=None):
                 ""
             )
 
-            package_id_lower = str(package_id).lower()
+            package_id_lower = str(
+                package_id
+            ).lower()
 
             if "twilio" in package_id_lower:
                 keyword = "twilio-java"
@@ -198,7 +182,9 @@ def run_evaluation(config, json_files, limit=None):
                 continue
 
             proj_name = str(
-                repo_path.relative_to(CLONED_REPOS_DIR)
+                repo_path.relative_to(
+                    CLONED_REPOS_DIR
+                )
             )
 
             parent_focal_class = project_obj.get(
@@ -221,46 +207,40 @@ def run_evaluation(config, json_files, limit=None):
                     )
                 )
 
-                # ============================================================
-                # SKIP ASYNC TESTS
-                # ============================================================
 
-                if should_skip_async_test(dp):
-                    skipped_async += 1
-
-                    print(
-                        f"    [SKIP ASYNC] {item_id}"
-                    )
-
-                    continue
 
                 # ============================================================
-                # CACHE FILTERING
+                # SKIP KNOWN BROKEN TESTS
                 # ============================================================
 
                 if config["run_mode"] != "human":
 
-                    if not compile_cache.get(item_id, False):
+                    if broken_tests.get(item_id, False):
+
+                        skipped_broken += 1
 
                         print(
-                            f"    [SKIP CACHE] "
-                            f"{item_id} "
-                            f"(human baseline failed)"
+                            f"    [SKIP BROKEN] "
+                            f"{item_id}"
                         )
 
                         continue
 
-                dp["_test_file_path"] = project_obj.get(
-                    "testClass",
-                    {}
-                ).get(
-                    "filePath",
-                    ""
-                ).lstrip("/")
+                dp["_test_file_path"] = (
+                    project_obj.get(
+                        "testClass",
+                        {}
+                    ).get(
+                        "filePath",
+                        ""
+                    ).lstrip("/")
+                )
 
                 dp["_project_name"] = proj_name
 
-                dp["_focalClass"] = parent_focal_class
+                dp["_focalClass"] = (
+                    parent_focal_class
+                )
 
                 state = {
                     "raw_datapoint": dp,
@@ -271,7 +251,9 @@ def run_evaluation(config, json_files, limit=None):
                     "iteration": 0,
                     "max_iterations": 3,
                     "feedback_history": [],
-                    "best_score": 0.0
+                    "best_score": 0.0,
+                    "mutation_score": None,
+                    "test_strength": None
                 }
 
                 start = time.time()
@@ -285,7 +267,10 @@ def run_evaluation(config, json_files, limit=None):
                 # ============================================================
 
                 generated_assertions = str(
-                    final.get("generated_assertions", "")
+                    final.get(
+                        "prediction",
+                        ""
+                    )
                 )
 
                 if not is_valid_generated_assertion(
@@ -302,29 +287,26 @@ def run_evaluation(config, json_files, limit=None):
                     continue
 
                 # ============================================================
-                # HUMAN CACHE SAVE
+                # SAVE BROKEN TEST RESULTS
                 # ============================================================
 
                 if config["run_mode"] == "human":
 
-                    is_valid = (
-                        final.get("is_compiled", False)
-                        and not final.get(
-                            "is_quarantined",
-                            False
-                        )
+                    is_broken = not final.get(
+                        "is_compiled",
+                        False
                     )
 
-                    compile_cache[item_id] = is_valid
+                    broken_tests[item_id] = is_broken
 
                     with open(
-                        cache_file,
+                        broken_file,
                         "w",
                         encoding="utf-8"
                     ) as f:
 
                         json.dump(
-                            compile_cache,
+                            broken_tests,
                             f,
                             indent=4
                         )
@@ -334,47 +316,59 @@ def run_evaluation(config, json_files, limit=None):
                 # ============================================================
 
                 processed_count += 1
+
                 total_time += dur
 
-                is_quarantined = final.get(
-                    "is_quarantined",
-                    False
-                )
-
-                score = (
-                    final.get("mutation_score", 0.0)
-                    if final.get("mutation_score")
+                mutation_score = (
+                    final.get(
+                        "mutation_score",
+                        0.0
+                    )
+                    if final.get(
+                        "mutation_score"
+                    ) is not None
                     else 0.0
                 )
 
-                if is_quarantined:
-
-                    quarantined_runs += 1
-
-                    print(
-                        f"    [{processed_count}] "
-                        f"{item_id} "
-                        f"| QUARANTINED "
-                        f"| Time: {dur:.2f}s"
+                test_strength = (
+                    final.get(
+                        "test_strength",
+                        0.0
                     )
+                    if final.get(
+                        "test_strength"
+                    ) is not None
+                    else 0.0
+                )
 
-                else:
+                completed_runs += 1
 
-                    completed_runs += 1
-                    total_test_strength += score
+                total_test_strength += test_strength
+                total_mutation_score += mutation_score
 
-                    running_avg = (
-                        total_test_strength
-                        / completed_runs
-                    )
+                running_avg_ts = (
+                    total_test_strength
+                    / completed_runs
+                )
 
-                    print(
-                        f"    [{processed_count}] "
-                        f"{item_id} "
-                        f"| Test Strength: {score:.4f} "
-                        f"| Running Avg: {running_avg:.4f} "
-                        f"| Time: {dur:.2f}s"
-                    )
+                running_avg_ms = (
+                    total_mutation_score
+                    / completed_runs
+                )
+
+                print(
+                    f"    [{processed_count}] "
+                    f"{item_id} "
+                    f"| Test Strength: "
+                    f"{test_strength:.4f} "
+                    f"| Mutation Score: "
+                    f"{mutation_score:.4f} "
+                    f"| Running Avg TS: "
+                    f"{running_avg_ts:.4f} "
+                    f"| Running Avg MS: "
+                    f"{running_avg_ms:.4f} "
+                    f"| Time: {dur:.2f}s"
+                )
 
     final_avg = (
         total_test_strength / completed_runs
@@ -393,8 +387,8 @@ def run_evaluation(config, json_files, limit=None):
     print("=" * 60)
 
     print(f"Completed Runs:      {completed_runs}")
-    print(f"Quarantined Runs:    {quarantined_runs}")
-    print(f"Skipped Async Tests: {skipped_async}")
+    print(f"Skipped Broken:      {skipped_broken}")
+
     print(f"Skipped Invalid:     {skipped_invalid}")
 
     return final_avg, avg_time, completed_runs
@@ -504,9 +498,12 @@ def main():
 
             print(
                 f"{name:<20} "
-                f"| Avg Test Strength: {metrics[0]:.4f} "
-                f"| Valid Runs: {metrics[2]} "
-                f"| Avg Time: {metrics[1]:.2f}s"
+                f"| Avg Test Strength: "
+                f"{metrics[0]:.4f} "
+                f"| Valid Runs: "
+                f"{metrics[2]} "
+                f"| Avg Time: "
+                f"{metrics[1]:.2f}s"
             )
 
     else:
@@ -531,7 +528,8 @@ def main():
 
         print(
             f"\nDONE. "
-            f"Final Avg Test Strength: {avg_s:.4f} "
+            f"Final Avg Test Strength: "
+            f"{avg_s:.4f} "
             f"| Valid Runs: {completed} "
             f"| Avg Time: {avg_t:.2f}s"
         )

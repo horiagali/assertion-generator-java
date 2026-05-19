@@ -1,10 +1,13 @@
-from typing import Dict, Any, Optional, Literal, List
-from typing_extensions import TypedDict
+from typing import TypedDict, Optional, List
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
 
-    raw_datapoint: Dict[str, Any]
+    # =========================================================
+    # RAW DATA
+    # =========================================================
+
+    raw_datapoint: dict
 
     item_id: str
 
@@ -14,27 +17,19 @@ class AgentState(TypedDict):
 
     info_file_path: str
 
-    prompt_context: str
-
-    ground_truth: str
-
     file_path: str
 
     method_signature: str
 
-    is_quarantined: bool
+    ground_truth: str
 
-    prediction: Optional[str]
+    prompt_context: str
 
-    is_compiled: bool
+    # =========================================================
+    # EXECUTION MODES
+    # =========================================================
 
-    mutation_score: Optional[float]
-
-    run_mode: Literal["human", "oneshot", "agentic"]
-
-    # =====================================================
-    # ABLATION FLAGS
-    # =====================================================
+    run_mode: str
 
     use_summarizer: bool
 
@@ -42,19 +37,33 @@ class AgentState(TypedDict):
 
     use_evaluator_loop: bool
 
-    # =====================================================
-    # AGENT MEMORY
-    # =====================================================
+    # =========================================================
+    # GENERATION
+    # =========================================================
 
-    summary: Optional[str]
+    prediction: Optional[str]
 
-    plan: Optional[str]
+    # =========================================================
+    # COMPILATION / EXECUTION
+    # =========================================================
 
-    improvement_plan: Optional[str]
+    is_compiled: bool
 
-    latest_feedback: Optional[str]
+    is_broken: bool
 
-    available_variables: List[str]
+    compile_time: float
+
+    # =========================================================
+    # MUTATION METRICS
+    # =========================================================
+
+    mutation_score: Optional[float]
+
+    test_strength: Optional[float]
+
+    # =========================================================
+    # AGENTIC LOOP
+    # =========================================================
 
     iteration: int
 
@@ -62,6 +71,6 @@ class AgentState(TypedDict):
 
     feedback_history: List[str]
 
-    best_prediction: Optional[str]
+    critic_feedback: str
 
     best_score: float

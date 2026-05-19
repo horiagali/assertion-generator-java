@@ -11,7 +11,6 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 
 from state import AgentState
-from utils.eval_tools import parse_maven_compile_log
 
 from config import (
     MUTATION_JAR_PATH,
@@ -34,46 +33,136 @@ llm = ChatOpenAI(
 )
 
 # =========================================================
-# PIT MUTANT FEEDBACK STRATEGY
+# ASSERTION HELPERS
 # =========================================================
 
 def normalize_assertions(text: str) -> list[str]:
-    lines = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("```"):
-            continue
-        lines.append(stripped)
-    return lines
 
-def extract_pit_mutant_details(stdout: str, csv_path: Path = None, limit=15) -> str:
+    cleaned = []
+
+    for line in text.splitlines():
+
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        if stripped.startswith("```"):
+            continue
+
+        if stripped not in cleaned:
+            cleaned.append(stripped)
+
+    return cleaned
+
+
+def merge_assertions(
+    previous_assertions: str,
+    new_assertions: str
+) -> str:
+
+    previous = normalize_assertions(previous_assertions)
+
+    new = normalize_assertions(new_assertions)
+
+    merged = list(previous)
+
+    for assertion in new:
+
+        if assertion not in merged:
+            merged.append(assertion)
+
+    return "\n".join(merged)
+
+
+def clean_llm_output(text: str) -> str:
+
+    text = text.replace("```java", "")
+    text = text.replace("```", "")
+
+    return text.strip()
+
+
+def extract_assertions_only(text: str) -> str:
     """
-    Extracts precise mutant feedback from the CSV report.
+    Keeps ONLY valid Java assertion statements.
+    Prevents model chatter from entering Java files.
     """
+
+    cleaned = []
+
+    allowed_prefixes = (
+        "assert",
+        "Assertions.",
+        "fail("
+    )
+
+    for line in text.splitlines():
+
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        if stripped.startswith("```"):
+            continue
+
+        if stripped.startswith(allowed_prefixes):
+
+            if not stripped.endswith(";"):
+                continue
+
+            cleaned.append(stripped)
+
+    return "\n".join(cleaned)
+
+
+# =========================================================
+# PIT FEEDBACK EXTRACTION
+# =========================================================
+
+def extract_pit_mutant_details(
+    stdout: str,
+    csv_path: Path = None,
+    limit: int = 15
+) -> str:
+
     mutants = []
 
     if csv_path and csv_path.exists():
+
         try:
+
             with open(csv_path, "r", encoding="utf-8") as f:
+
                 reader = csv.reader(f)
+
                 for row in reader:
+
                     if len(row) < 6:
                         continue
 
-                    mutated_class = row[1].split('.')[-1]
+                    mutated_class = row[1].split(".")[-1]
                     mutator = row[3]
                     line = row[4]
                     status = row[5].strip()
 
                     if status == "SURVIVED":
-                        mutants.append(f"Line {line} ({mutated_class}): {mutator} survived")
+
+                        mutants.append(
+                            f"Line {line} "
+                            f"({mutated_class}) "
+                            f"- {mutator}"
+                        )
+
         except Exception:
             pass
 
     if not mutants:
-        return "No mutants survived on the covered lines."
+        return "No surviving mutants detected."
 
     return "\n".join(mutants[:limit])
+
 
 # =========================================================
 # SANDBOX EXECUTION
@@ -81,131 +170,335 @@ def extract_pit_mutant_details(stdout: str, csv_path: Path = None, limit=15) -> 
 
 def execute_sandbox(state: AgentState) -> Dict:
 
-    prediction = state.get("prediction")
+    prediction = state.get("prediction", "")
+
     project_name = state.get("project_name")
     project_id = state.get("project_id")
     item_id = state.get("item_id")
+
     file_path = state.get("file_path", "")
 
     java_bin = JAVA_HOME / "bin" / "java"
+
     repo_path = CLONED_REPOS_DIR / str(project_name)
 
     miner_json_path = (
-        DATA_PROJECT_DIR / "scripts" / "test-miner" / "output" / "miner" / f"{project_name}.json"
+        DATA_PROJECT_DIR
+        / "scripts"
+        / "test-miner"
+        / "output"
+        / "miner"
+        / f"{project_name}.json"
     )
 
-    # 1. CLEANUP
+    # =====================================================
+    # CLEANUP
+    # =====================================================
+
     for root, dirs, files in os.walk(repo_path):
+
         for file in files:
+
             if "STAR" in file and file.endswith(".java"):
-                try: os.remove(os.path.join(root, file))
-                except Exception: pass
+
+                try:
+                    os.remove(os.path.join(root, file))
+                except Exception:
+                    pass
 
     pit_reports_path = repo_path / "target" / "pit-reports"
+
     if pit_reports_path.exists():
         shutil.rmtree(pit_reports_path)
 
     try:
-        subprocess.run(["git", "checkout", "--", "src/test"], cwd=str(repo_path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        subprocess.run(
+            ["git", "checkout", "--", "src/test"],
+            cwd=str(repo_path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
     except Exception:
         pass
 
-    # 2. INJECT
-    prediction_file = SANDBOX_DIR / f"{item_id}_agentic_prediction.txt"
+    # =====================================================
+    # CLEAN ASSERTIONS
+    # =====================================================
+
+    prediction = extract_assertions_only(
+        prediction
+    )
+
+    # =====================================================
+    # INJECTION
+    # =====================================================
+
+    prediction_file = (
+        SANDBOX_DIR
+        / f"{item_id}_agentic_prediction.txt"
+    )
+
     with open(prediction_file, "w", encoding="utf-8") as f:
+
         f.write(f"[oracle]{prediction}[/oracle]")
 
     cmd_inject = [
-        str(java_bin), "-jar", str(MUTATION_JAR_PATH),
-        str(project_id), str(repo_path), str(miner_json_path),
-        str(SANDBOX_DIR), str(DATA_PROJECT_DIR / "scripts" / "dataset"),
-        str(ORACLE_CONFIG_JSON), "INFERENCE", str(prediction_file)
+        str(java_bin),
+        "-jar",
+        str(MUTATION_JAR_PATH),
+
+        str(project_id),
+        str(repo_path),
+        str(miner_json_path),
+
+        str(SANDBOX_DIR),
+
+        str(
+            DATA_PROJECT_DIR
+            / "scripts"
+            / "dataset"
+        ),
+
+        str(ORACLE_CONFIG_JSON),
+
+        "INFERENCE",
+        str(prediction_file)
     ]
 
     env = os.environ.copy()
+
     env["JAVA_HOME"] = str(JAVA_HOME)
 
-    inject_res = subprocess.run(cmd_inject, cwd=str(repo_path), env=env, capture_output=True, text=True, timeout=600)
-
-    # Clean Extra STAR Files
-    if file_path:
-        target_stem = Path(file_path).stem
-        for root, dirs, files in os.walk(repo_path / "src" / "test"):
-            for file in files:
-                if "STAR" in file and not file.startswith(target_stem):
-                    try: os.remove(os.path.join(root, file))
-                    except Exception: pass
+    inject_res = subprocess.run(
+        cmd_inject,
+        cwd=str(repo_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600
+    )
 
     if inject_res.returncode != 0:
-        return {"is_compiled": False, "compile_error": "Injection Failed. Syntax error in assertions."}
 
-    # 3. RUN PIT
+        return {
+            "is_compiled": False,
+            "compile_error": (
+                "Injection failed due to invalid assertions."
+            )
+        }
+
+    # =====================================================
+    # CLEAN EXTRA STAR FILES
+    # =====================================================
+
+    if file_path:
+
+        target_stem = Path(file_path).stem
+
+        for root, dirs, files in os.walk(
+            repo_path / "src" / "test"
+        ):
+
+            for file in files:
+
+                if (
+                    "STAR" in file
+                    and not file.startswith(target_stem)
+                ):
+
+                    try:
+                        os.remove(os.path.join(root, file))
+                    except Exception:
+                        pass
+
+    # =====================================================
+    # PIT CONFIG
+    # =====================================================
+
     target_tests = "*"
     target_classes = "*"
 
     if file_path:
-        parts = str(file_path).replace("\\", "/").split("src/test/java/")
+
+        parts = (
+            str(file_path)
+            .replace("\\", "/")
+            .split("src/test/java/")
+        )
+
         if len(parts) > 1:
+
             class_path = parts[-1].replace(".java", "")
+
             test_fqn = class_path.replace("/", ".")
+
             target_tests = test_fqn + "*"
+
             pkg_parts = test_fqn.split(".")
+
             class_name = pkg_parts[-1]
-            if class_name.endswith("STARSplitTest"): class_name = class_name[:-13]
-            if class_name.endswith("Test"): class_name = class_name[:-4]
-            target_classes = ".".join(pkg_parts[:-1]) + "." + class_name if len(pkg_parts) > 1 else class_name
+
+            if class_name.endswith("STARSplitTest"):
+                class_name = class_name[:-13]
+
+            if class_name.endswith("Test"):
+                class_name = class_name[:-4]
+
+            if len(pkg_parts) > 1:
+
+                target_classes = (
+                    ".".join(pkg_parts[:-1])
+                    + "."
+                    + class_name
+                )
+
+            else:
+                target_classes = class_name
+
+    # =====================================================
+    # PIT EXECUTION
+    # =====================================================
 
     cmd_mvn = [
-        "mvn", "test-compile", "org.pitest:pitest-maven:mutationCoverage",
-        "-DjvmArgs=--add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED",
+        "mvn",
+
+        "test-compile",
+
+        "org.pitest:pitest-maven:mutationCoverage",
+
+        "-DjvmArgs=--add-opens java.base/java.lang=ALL-UNNAMED "
+        "--add-opens java.base/java.lang.reflect=ALL-UNNAMED",
+
         f"-DtargetClasses={target_classes}",
         f"-DtargetTests={target_tests}",
+
         "-Dmutators=ALL",
+
         "-DoutputFormats=CSV",
+
         "-DtimestampedReports=false",
-        "-q" # Maven Quiet Mode to suppress standard info/warnings
+
+        "-q"
     ]
 
-    mvn_res = subprocess.run(cmd_mvn, cwd=str(repo_path), env=env, capture_output=True, text=True, timeout=1200)
+    mvn_res = subprocess.run(
+        cmd_mvn,
+        cwd=str(repo_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1200
+    )
+
     stdout = mvn_res.stdout
 
-    # Clean compile error extraction (No Console Spam)
-    if "Compilation failure" in stdout or "COMPILATION ERROR" in stdout:
-        errors = [line.strip() for line in stdout.splitlines() if "[ERROR]" in line and "COMPILATION ERROR" not in line]
-        error_msg = "\n".join(errors[:3]) if errors else "Maven compilation failure due to invalid Java code."
-        return {"is_compiled": False, "compile_error": error_msg}
+    # =====================================================
+    # COMPILE ERROR EXTRACTION
+    # =====================================================
 
-    # 4. SCORE
+    if (
+        "Compilation failure" in stdout
+        or "COMPILATION ERROR" in stdout
+    ):
+
+        errors = []
+
+        for line in stdout.splitlines():
+
+            if (
+                "[ERROR]" in line
+                and "COMPILATION ERROR" not in line
+            ):
+
+                errors.append(line.strip())
+
+        error_msg = (
+            "\n".join(errors[:8])
+            if errors
+            else "Maven compilation failure."
+        )
+
+        return {
+            "is_compiled": False,
+            "compile_error": error_msg
+        }
+
+    # =====================================================
+    # SCORE COMPUTATION
+    # =====================================================
+
     mutations_csv_path = None
+
     target_dir = repo_path / "target" / "pit-reports"
 
     if target_dir.exists():
+
         for root, dirs, files in os.walk(target_dir):
+
             if "mutations.csv" in files:
-                mutations_csv_path = Path(root) / "mutations.csv"
+
+                mutations_csv_path = (
+                    Path(root) / "mutations.csv"
+                )
+
                 break
 
-    score = 0.0
-    if mutations_csv_path and mutations_csv_path.exists():
-        with open(mutations_csv_path, 'r', encoding='utf-8') as csvfile:
+    mutation_score = 0.0
+    test_strength = 0.0
+
+    if (
+        mutations_csv_path
+        and mutations_csv_path.exists()
+    ):
+
+        generated = 0
+        killed = 0
+
+        with open(
+            mutations_csv_path,
+            "r",
+            encoding="utf-8"
+        ) as csvfile:
+
             reader = csv.reader(csvfile)
-            generated = 0
-            killed = 0
+
             for row in reader:
-                if len(row) < 6: continue
+
+                if len(row) < 6:
+                    continue
+
                 status = row[5].strip()
-                if status == "NO_COVERAGE": continue
+
+                if status == "NO_COVERAGE":
+                    continue
+
                 generated += 1
-                if status in ("KILLED", "TIMED_OUT", "MEMORY_ERROR"):
+
+                if status in (
+                    "KILLED",
+                    "TIMED_OUT",
+                    "MEMORY_ERROR"
+                ):
+
                     killed += 1
-            if generated > 0:
-                score = killed / generated
+
+        if generated > 0:
+
+            mutation_score = killed / generated
+            test_strength = mutation_score
 
     return {
         "is_compiled": True,
         "stdout": stdout,
-        "score": score,
-        "mutations_csv": str(mutations_csv_path) if mutations_csv_path else None
+        "mutation_score": mutation_score,
+        "test_strength": test_strength,
+        "mutations_csv": (
+            str(mutations_csv_path)
+            if mutations_csv_path
+            else None
+        )
     }
 
 
@@ -214,182 +507,508 @@ def execute_sandbox(state: AgentState) -> Dict:
 # =========================================================
 
 def summarizer_node(state: AgentState) -> Dict:
-    print("      >> [AGENT] Summarizing Context...")
-    system_msg = (
-        "You are a strict Java Static Analysis Tool. Your task is to build a Variable Manifest.\n"
-        "RULES:\n"
-        "1. DO NOT GUESS method names. Only list methods explicitly visible in the Focal Class source code.\n"
-        "2. INFER FROM CONSTRUCTORS: If the Focal Class returns 'new Response(a, b, c)', assume the result object has properties for a, b, and c.\n"
-        "3. TEST STUB ANCHOR: List every variable declared in the 'TEST FILE CONTEXT (STUB)' and its visible type.\n"
-        "4. ASSERTION ONLY: Identify only those elements that can be passed into an assertEquals() or assertTrue()."
-    )
 
-    response = llm.invoke([("system", system_msg), ("human", state["prompt_context"])])
+    print("      >> [AGENT] Summarizing Context...")
+
+    system_msg = """
+You are a strict Java static analyzer.
+
+TASK:
+Analyze ONLY the provided test method body and focal class.
+
+OUTPUT FORMAT MUST BE EXACTLY:
+
+TEST_METHOD:
+...
+
+TEST_SCOPE_VARIABLES:
+- variable : type : origin
+
+FOCAL_METHODS:
+- methodSignature -> returnType
+
+VISIBLE_BEHAVIOR:
+- ...
+
+ASSERTABLE_RELATIONS:
+- ...
+
+NULLABILITY:
+- ...
+
+CONSTRAINTS:
+- ...
+
+RULES:
+1. ONLY use explicitly visible code.
+2. NEVER invent variables.
+3. NEVER invent constructor args.
+4. NEVER assume 'this' is the focal class.
+5. TEST_SCOPE_VARIABLES must contain ONLY variables declared in the test body.
+6. FOCAL_METHODS may contain focal-class methods.
+7. NO prose.
+8. NO explanations.
+9. NO recommendations.
+10. NO markdown.
+"""
+
+    print("\n========= PROMPT CONTEXT =========\n")
+
+    print(state["prompt_context"])
+
+    print("\n==================================\n")
+
+    response = llm.invoke([
+        ("system", system_msg),
+        ("human", state["prompt_context"])
+    ])
+
     summary = response.content.strip()
-    
-    print(f"         [MANIFEST]:\n{summary}\n")
-    return {"summary": summary}
+
+    print(f"         [MANIFEST]\n{summary}\n")
+
+    return {
+        "summary": summary
+    }
 
 
 def planner_node(state: AgentState) -> Dict:
+
     print("      >> [AGENT] Planning Assertions...")
-    system_msg = (
-        "You are a Mutation Testing Strategist. Design an assertion strategy to maximize Test Strength.\n"
-        "STRICT RULE: Do NOT provide any Java code or snippets. Use only high-level natural language instructions."
+
+    system_msg = """
+You are a mutation testing strategist.
+
+TASK:
+Design assertion objectives that maximize PIT mutation score.
+
+OUTPUT FORMAT MUST BE EXACTLY:
+
+PRIMARY_TARGETS:
+- ...
+
+HIGH_VALUE_ASSERTIONS:
+- ...
+
+MUTATION_RISKS:
+- ...
+
+INVALID_ASSERTION_RISKS:
+- ...
+
+ASSERTION_PRIORITIES:
+1. ...
+2. ...
+3. ...
+
+RULES:
+1. NO Java code.
+2. NO assertions.
+3. NO prose paragraphs.
+4. Use compact bullet points only.
+5. Focus on semantic verification.
+6. Use ONLY visible variables and methods.
+7. Flag invalid scope assumptions.
+8. Prefer exact semantic checks over null checks.
+"""
+
+    context = (
+        f"MANIFEST:\n"
+        f"{state.get('summary', '')}\n\n"
+
+        f"TARGET CONTEXT:\n"
+        f"{state['prompt_context']}"
     )
-    context = f"Manifest:\n{state.get('summary', 'None')}\n\nTarget Code:\n{state['prompt_context']}"
-    
-    response = llm.invoke([("system", system_msg), ("human", context)])
+
+    response = llm.invoke([
+        ("system", system_msg),
+        ("human", context)
+    ])
+
     plan = response.content.strip()
-    
-    print(f"         [PLAN]:\n{plan}\n")
-    return {"plan": plan}
+
+    print(f"         [PLAN]\n{plan}\n")
+
+    return {
+        "plan": plan
+    }
 
 
 def coder_node(state: AgentState) -> Dict:
-    print("      >> [AGENT] Coding Assertions...")
+
+    print("      >> [AGENT] Generating Assertions...")
+
     manifest = state.get("summary", "")
-    strategy = state.get("improvement_plan") or state.get("plan", "Generate specific, high-precision assertions.")
-    previous_code = state.get("prediction", "")
+
+    strategy = (
+        state.get("improvement_plan")
+        or state.get("plan")
+        or ""
+    )
+
+    previous_assertions = state.get("prediction", "")
 
     prompt = (
-        f"CONTEXT:\n{state['prompt_context']}\n\n"
-        f"TRUTH MANIFEST (Variables/Methods):\n{manifest}\n\n"
-        f"PLAN TO FOLLOW:\n{strategy}\n\n"
+        f"TARGET CONTEXT:\n"
+        f"{state['prompt_context']}\n\n"
+
+        f"ASSERTION MANIFEST:\n"
+        f"{manifest}\n\n"
+
+        f"ASSERTION STRATEGY:\n"
+        f"{strategy}\n\n"
     )
 
-    if previous_code:
-        prompt += f"PREVIOUS CODE (FIX ERRORS IF ANY):\n{previous_code}\n\n"
+    if previous_assertions:
 
-    prompt += (
-        "INSTRUCTION: Output ONLY pure Java assertion lines (e.g. assertEquals(x, y);).\n"
-        "CRITICAL: If the previous code failed to compile, change the method names to match the MANIFEST.\n"
-        "Unless the Manifest explicitly shows a custom accessor, assume standard Java Getters (e.g., use getCode() instead of code())."
+        prompt += (
+            f"PREVIOUS ASSERTIONS:\n"
+            f"{previous_assertions}\n\n"
+        )
+
+    prompt += """
+TASK:
+Generate ONLY valid Java assertion statements.
+
+STRICT RULES:
+1. OUTPUT ONLY assertion statements.
+2. EACH line must end with ';'
+3. NO prose.
+4. NO labels.
+5. NO markdown.
+6. NO comments.
+7. NO variable declarations.
+8. NO helper methods.
+9. NO method wrappers.
+10. NO explanation text.
+11. NO duplicate assertions.
+12. Use ONLY variables explicitly visible in TEST_SCOPE_VARIABLES.
+13. Never use focal-class methods without an object reference.
+14. Never output section headers.
+15. If uncertain, output fewer assertions.
+"""
+
+    system_msg = (
+        "You are an expert Java mutation-testing engineer."
     )
 
-    system_msg = "You are a JUnit Expert. Output ONLY pure Java assertion lines. No markdown. No chatter. No logic setup."
-    response = llm.invoke([("system", system_msg), ("human", prompt)])
+    response = llm.invoke([
+        ("system", system_msg),
+        ("human", prompt)
+    ])
 
-    new_prediction = response.content.strip().replace("```java", "").replace("```", "").strip()
+    raw_output = clean_llm_output(
+        response.content
+    )
 
-    previous = normalize_assertions(previous_code)
-    new = normalize_assertions(new_prediction)
-    combined = list(previous)
+    raw_output = extract_assertions_only(
+        raw_output
+    )
 
-    for n in new:
-        if n not in combined:
-            combined.append(n)
+    combined_assertions = merge_assertions(
+        previous_assertions,
+        raw_output
+    )
 
-    combined_prediction = "\n".join(combined)
-    print(f"         [CODE]:\n{combined_prediction}\n")
-    return {"prediction": combined_prediction}
+    print(
+        f"         [ASSERTIONS]\n"
+        f"{combined_assertions}\n"
+    )
 
+    return {
+        "prediction": combined_assertions
+    }
 
 def critic_node(state: AgentState) -> Dict:
-    print("      >> [AGENT] Critic Executing Sandbox...")
+
+    print("      >> [AGENT] Executing Sandbox...")
+
     result = execute_sandbox(state)
 
-    if not result.get("is_compiled", True):
-        compile_err = result.get("compile_error", "Unknown Compilation Error.")
-        feedback = f"COMPILATION FAILED:\n{compile_err}"
-        score = 0.0
-    else:
-        score = result["score"]
-        mutant_details = extract_pit_mutant_details(
-            result["stdout"],
-            Path(result.get("mutations_csv")) if result.get("mutations_csv") else None
-        )
-        feedback = f"PIT Score: {score:.2f}\n\nSURVIVING MUTANTS:\n{mutant_details}"
+    test_strength = 0.0
+    mutation_score = 0.0
+    verified = False
 
-    print(f"         [CRITIC RESULT]:\n{feedback}\n")
+    if not result.get("is_compiled", True):
+
+        compile_error = result.get(
+            "compile_error",
+            "Unknown compilation error."
+        )
+
+        feedback = (
+            "COMPILATION FAILURE\n\n"
+            f"{compile_error}"
+        )
+
+    else:
+
+        mutation_score = result.get(
+            "mutation_score",
+            0.0
+        )
+
+        test_strength = result.get(
+            "test_strength",
+            0.0
+        )
+
+        verified = result.get(
+            "verified",
+            False
+        )
+
+        mutant_details = extract_pit_mutant_details(
+            result.get("stdout", ""),
+            (
+                Path(result["mutations_csv"])
+                if result.get("mutations_csv")
+                else None
+            )
+        )
+
+        print("\n         [SURVIVING MUTANTS RAW]\n")
+        print(mutant_details)
+
+        feedback = (
+            f"TEST STRENGTH: {test_strength:.4f}\n"
+            f"MUTATION SCORE: {mutation_score:.4f}\n"
+            f"VERIFIED: {verified}\n\n"
+            f"SURVIVING MUTANTS:\n"
+            f"{mutant_details}"
+        )
+
+    print(f"         [CRITIC]\n{feedback}\n")
 
     best_score = state.get("best_score", 0.0)
-    best_pred = state.get("best_prediction", "")
 
-    if score > best_score:
-        best_score = score
-        best_pred = state["prediction"]
+    best_prediction = state.get(
+        "best_prediction",
+        ""
+    )
+
+    if verified and test_strength > best_score:
+
+        best_score = test_strength
+
+        best_prediction = state.get(
+            "prediction",
+            ""
+        )
 
     return {
         "iteration": state.get("iteration", 0) + 1,
         "latest_feedback": feedback,
         "best_score": best_score,
-        "best_prediction": best_pred
+        "best_prediction": best_prediction,
+        "mutation_score": mutation_score,
+        "test_strength": test_strength,
+        "verified": verified
+    }
+
+def improver_node(state: AgentState) -> Dict:
+
+    print("      >> [AGENT] Refining Strategy...")
+
+    system_msg = """
+You are a senior Java mutation-testing reviewer.
+
+TASK:
+Analyze why the previous assertion set failed or was weak.
+
+OUTPUT FORMAT MUST BE EXACTLY:
+
+FAILURE_ANALYSIS:
+- ...
+
+SURVIVING_MUTANT_ANALYSIS:
+- ...
+
+MISSING_VALIDATIONS:
+- ...
+
+INVALID_SCOPE_USAGE:
+- ...
+
+NEXT_ASSERTION_GOALS:
+- ...
+
+RULES:
+1. NO Java code.
+2. NO prose paragraphs.
+3. NO explanations outside bullet points.
+4. Focus on semantic gaps.
+5. Focus on scope errors.
+6. Focus on compile failures.
+7. Focus on surviving mutant causes.
+"""
+
+    context = (
+        f"MANIFEST:\n"
+        f"{state.get('summary', '')}\n\n"
+
+        f"PREVIOUS ASSERTIONS:\n"
+        f"{state.get('prediction', '')}\n\n"
+
+        f"EXECUTION FEEDBACK:\n"
+        f"{state.get('latest_feedback', '')}"
+    )
+
+    response = llm.invoke([
+        ("system", system_msg),
+        ("human", context)
+    ])
+
+    improvement_plan = response.content.strip()
+
+    print(
+        f"         [REFINEMENT PLAN]\n"
+        f"{improvement_plan}\n"
+    )
+
+    return {
+        "improvement_plan": improvement_plan
     }
 
 
-def improver_node(state: AgentState) -> Dict:
-    print("      >> [AGENT] Improving...")
-    system_msg = (
-        "You are a Mutation Testing Strategist. Analyze why the last attempt failed or scored poorly.\n"
-        "If it was a COMPILATION ERROR, identify the illegal method call.\n"
-        "If it was surviving mutants, explain how to make the assertions more strict.\n"
-        "STRICT: Natural language only. No code snippets."
-    )
-    context = (
-        f"MANIFEST:\n{state.get('summary', 'None')}\n\n"
-        f"LAST CODE ATTEMPT:\n{state.get('prediction', 'None')}\n\n"
-        f"EXECUTION FEEDBACK:\n{state.get('latest_feedback', '')}"
-    )
-
-    response = llm.invoke([("system", system_msg), ("human", context)])
-    plan = response.content.strip()
-    
-    print(f"         [IMPROVEMENT PLAN]:\n{plan}\n")
-    return {"improvement_plan": plan}
-
-
 # =========================================================
-# ROUTING + GRAPH (UNCHANGED)
+# ROUTING
 # =========================================================
 
 def route_start(state: AgentState) -> str:
+
     if state.get("use_summarizer"):
         return "summarizer"
+
     if state.get("use_planner"):
         return "planner"
+
     return "coder"
 
 
 def route_summarizer(state: AgentState) -> str:
+
     if state.get("use_planner"):
         return "planner"
+
     return "coder"
 
+def route_critic(state: AgentState):
 
-def route_critic(state: AgentState) -> str:
-    if state.get("best_score", 0.0) >= 1.0 or state.get("iteration", 0) >= state.get("max_iterations", 3):
+    best_score = state.get("best_score", 0.0)
+
+    verified = state.get("verified", False)
+
+    iteration = state.get("iteration", 0)
+
+    max_iterations = state.get(
+        "max_iterations",
+        3
+    )
+
+    if verified and best_score >= 1.0:
         return END
+
+    if iteration >= max_iterations:
+        return END
+
     return "improver"
 
 
+# =========================================================
+# GRAPH
+# =========================================================
+
 agent_workflow = StateGraph(AgentState)
 
-agent_workflow.add_node("summarizer", summarizer_node)
-agent_workflow.add_node("planner", planner_node)
-agent_workflow.add_node("coder", coder_node)
-agent_workflow.add_node("critic", critic_node)
-agent_workflow.add_node("improver", improver_node)
+agent_workflow.add_node(
+    "summarizer",
+    summarizer_node
+)
 
-agent_workflow.set_conditional_entry_point(route_start)
-agent_workflow.add_conditional_edges("summarizer", route_summarizer)
-agent_workflow.add_edge("planner", "coder")
-agent_workflow.add_edge("coder", "critic")
-agent_workflow.add_conditional_edges("critic", route_critic)
-agent_workflow.add_edge("improver", "coder")
+agent_workflow.add_node(
+    "planner",
+    planner_node
+)
 
-agent_app = workflow_compiled = agent_workflow.compile()
+agent_workflow.add_node(
+    "coder",
+    coder_node
+)
+
+agent_workflow.add_node(
+    "critic",
+    critic_node
+)
+
+agent_workflow.add_node(
+    "improver",
+    improver_node
+)
+
+agent_workflow.set_conditional_entry_point(
+    route_start
+)
+
+agent_workflow.add_conditional_edges(
+    "summarizer",
+    route_summarizer
+)
+
+agent_workflow.add_edge(
+    "planner",
+    "coder"
+)
+
+agent_workflow.add_edge(
+    "coder",
+    "critic"
+)
+
+agent_workflow.add_conditional_edges(
+    "critic",
+    route_critic
+)
+
+agent_workflow.add_edge(
+    "improver",
+    "coder"
+)
+
+agent_app = agent_workflow.compile()
+
+
+# =========================================================
+# ENTRYPOINT
+# =========================================================
 
 def run_agentic_logic(state: AgentState) -> Dict:
-    print("    >> [AGENTIC] Initializing Agentic Loop...")
-    
+
+    print(
+        "    >> [AGENTIC] "
+        "Starting Iterative Assertion Refinement..."
+    )
+
     state["best_score"] = 0.0
     state["best_prediction"] = ""
     state["iteration"] = 0
-    
+    state["is_compiled"] = False
+
     final_state = agent_app.invoke(state)
 
     return {
-        "prediction": final_state.get("best_prediction", final_state.get("prediction")),
-        "mutation_score": final_state.get("best_score", 0.0)
+        "prediction": final_state.get(
+            "best_prediction",
+            final_state.get("prediction", "")
+        ),
+
+        "mutation_score": final_state.get(
+            "mutation_score",
+            0.0
+        ),
+
+        "test_strength": final_state.get(
+            "best_score",
+            0.0
+        )
     }
