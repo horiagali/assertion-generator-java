@@ -57,7 +57,6 @@ def find_project_root(base_dir, project_keyword):
     return None
 
 
-
 def is_valid_generated_assertion(assertion_text):
     """
     Filters obviously useless/generated garbage assertions.
@@ -103,7 +102,14 @@ def run_evaluation(config, json_files, limit=None):
     skipped_broken = 0
     skipped_invalid = 0
 
+    # ============================================================
+    # DEBUG COUNTERS
+    # ============================================================
 
+    total_seen = 0
+    split0_seen = 0
+    compiled_tests = 0
+    pit_executed = 0
 
     broken_file = (
         DATA_PROJECT_DIR
@@ -194,6 +200,12 @@ def run_evaluation(config, json_files, limit=None):
 
             for dp in project_obj.get("datapoints", []):
 
+                # ============================================================
+                # COUNT ALL DATAPOINTS
+                # ============================================================
+
+                total_seen += 1
+
                 if limit and processed_count >= limit:
                     break
 
@@ -207,7 +219,26 @@ def run_evaluation(config, json_files, limit=None):
                     )
                 )
 
+                # ============================================================
+                # ONLY PROCESS split_0
+                # ============================================================
 
+                if not item_id.endswith("_split_0"):
+                    continue
+
+                split0_seen += 1
+
+                print(
+                    f"\n=================================================="
+                )
+
+                print(
+                    f"[PROCESSING] {item_id}"
+                )
+
+                print(
+                    f"==================================================\n"
+                )
 
                 # ============================================================
                 # SKIP KNOWN BROKEN TESTS
@@ -261,6 +292,18 @@ def run_evaluation(config, json_files, limit=None):
                 final = app.invoke(state)
 
                 dur = time.time() - start
+
+                # ============================================================
+                # COMPILE / PIT COUNTERS
+                # ============================================================
+
+                if final.get("is_compiled"):
+
+                    compiled_tests += 1
+
+                if final.get("mutation_score") is not None:
+
+                    pit_executed += 1
 
                 # ============================================================
                 # ASSERTION VALIDATION
@@ -386,10 +429,28 @@ def run_evaluation(config, json_files, limit=None):
     print("RUN SUMMARY")
     print("=" * 60)
 
-    print(f"Completed Runs:      {completed_runs}")
-    print(f"Skipped Broken:      {skipped_broken}")
+    print(f"Total JSON Datapoints:        {total_seen}")
+    print(f"split_0 Datapoints Seen:     {split0_seen}")
 
-    print(f"Skipped Invalid:     {skipped_invalid}")
+    print(f"Tests Successfully Compiled: {compiled_tests}")
+
+    print(f"PIT Successfully Executed:   {pit_executed}")
+
+    print(f"Completed Runs:              {completed_runs}")
+
+    print(f"Skipped Broken:              {skipped_broken}")
+
+    print(f"Skipped Invalid:             {skipped_invalid}")
+
+    print(
+        f"Average Test Strength:       "
+        f"{final_avg:.4f}"
+    )
+
+    print(
+        f"Average Runtime:             "
+        f"{avg_time:.2f}s"
+    )
 
     return final_avg, avg_time, completed_runs
 

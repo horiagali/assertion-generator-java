@@ -119,7 +119,6 @@ def cleanup_star_files(repo_path):
 # =============================================================================
 # DATA LOADER
 # =============================================================================
-
 def data_loader_node(state: AgentState) -> Dict:
 
     dp = state.get("raw_datapoint")
@@ -132,6 +131,22 @@ def data_loader_node(state: AgentState) -> Dict:
             "UNKNOWN"
         )
     )
+
+    # =========================================================
+    # ONLY PROCESS split_0
+    # =========================================================
+
+    if not item_id.endswith("_split_0"):
+
+        print(
+            f"    >> [SKIP NON-SPLIT0] "
+            f"{item_id}"
+        )
+
+        return {
+            "item_id": item_id,
+            "is_broken": True
+        }
 
     project_name = dp.get(
         "_project_name",
@@ -210,6 +225,9 @@ TARGET TEST METHOD:
 FOCAL CLASS:
 {focal_context}
 """.strip()
+
+    print("This is the code context:")
+    print(prompt_context)
 
     return {
         "item_id": item_id,
