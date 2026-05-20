@@ -793,23 +793,7 @@ def injection_node(state: AgentState) -> Dict:
         ) as f:
 
             f.write(content)
-        print(
-            "\n========= GENERATED TEST FILE =========\n"
-        )
 
-        print(original_file)
-
-        with open(
-            original_file,
-            "r",
-            encoding="utf-8"
-        ) as debug_f:
-
-            print(debug_f.read()[:2000])
-
-        print(
-            "\n========= END GENERATED TEST FILE =========\n"
-        )
         return {
             "is_compiled": True,
             "file_path": file_path_str

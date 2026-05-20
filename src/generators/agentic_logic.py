@@ -564,7 +564,7 @@ def execute_sandbox(state: AgentState) -> Dict:
                 "stdout": stdout
             }
 
-        # =====================================================
+               # =====================================================
         # PARSE PIT CSV
         # =====================================================
 
@@ -576,8 +576,13 @@ def execute_sandbox(state: AgentState) -> Dict:
         )
 
         surviving_summary = ""
+        detailed_feedback = ""
 
         if pit_csv_path.exists():
+
+            # =================================================
+            # EXTRACT SURVIVING MUTANT DETAILS
+            # =================================================
 
             surviving_summary = (
                 extract_pit_mutant_details(
@@ -597,7 +602,7 @@ def execute_sandbox(state: AgentState) -> Dict:
             )
 
             # =================================================
-            # COMPUTE SCORES
+            # COMPUTE RAW PIT METRICS
             # =================================================
 
             generated = 0
@@ -610,11 +615,14 @@ def execute_sandbox(state: AgentState) -> Dict:
                 encoding="utf-8"
             ) as csvfile:
 
-                reader = csv.reader(csvfile)
+                reader = csv.reader(
+                    csvfile
+                )
 
                 for row in reader:
 
                     if len(row) < 6:
+
                         continue
 
                     status = row[5].strip()
@@ -685,10 +693,8 @@ def execute_sandbox(state: AgentState) -> Dict:
             ),
             "compile_time": compile_time,
             "is_compiled": True,
-            "sandbox_feedback": stdout,
-            "surviving_mutants": surviving_summary,
-            "stdout": stdout,
-            "mutations_csv": str(pit_csv_path)
+            "sandbox_feedback": detailed_feedback,
+            "surviving_mutants": surviving_summary
         }
 
     except Exception as e:
@@ -715,19 +721,21 @@ def execute_sandbox(state: AgentState) -> Dict:
             "compile_time": 0.0,
             "is_compiled": False,
             "sandbox_feedback": traceback.format_exc(),
-            "stdout": stdout
+            "surviving_mutants": ""
         }
 
     finally:
 
         cleanup_star_files(repo_path)
 
-        target_dir = repo_path / "target"
+        target_dir = (
+            repo_path
+            / "target"
+        )
 
         if target_dir.exists():
 
             shutil.rmtree(target_dir)
-
 # =========================================================
 # AGENT NODES
 # =========================================================
@@ -1080,11 +1088,7 @@ def critic_node(state: AgentState) -> Dict:
     print("      >> [AGENT] Executing Sandbox...")
 
     result = execute_sandbox(state)
-    print("\n========= RAW SANDBOX RESULT =========\n")
 
-    print(result)
-
-    print("\n========= END RAW SANDBOX RESULT =========\n")
     test_strength = 0.0
     mutation_score = 0.0
 
@@ -1114,13 +1118,9 @@ def critic_node(state: AgentState) -> Dict:
 
 
 
-        mutant_details = extract_pit_mutant_details(
-            result.get("stdout", ""),
-            (
-                Path(result["mutations_csv"])
-                if result.get("mutations_csv")
-                else None
-            )
+        mutant_details = result.get(
+            "surviving_mutants",
+            "No surviving mutant details."
         )
 
         print("\n         [SURVIVING MUTANTS RAW]\n")
