@@ -123,6 +123,10 @@ def data_loader_node(state: AgentState) -> Dict:
 
     dp = state.get("raw_datapoint")
 
+    import json
+
+
+
     test_prefix = dp.get("testPrefix", {})
 
     item_id = str(
@@ -182,10 +186,39 @@ def data_loader_node(state: AgentState) -> Dict:
         is_broken = True
 
     # =========================================================
-    # FOCAL CLASS CONTEXT
+    # FULL FOCAL CLASS EXTRACTION
     # =========================================================
 
+    focal_fields = []
+
+    focal_constructors = []
+
     focal_methods = []
+
+    for field in focal_class.get("fields", []):
+
+        signature = field.get(
+            "fullSignature",
+            ""
+        )
+
+        focal_fields.append(signature)
+
+    for ctor in focal_class.get("constructors", []):
+
+        signature = ctor.get(
+            "signature",
+            ""
+        )
+
+        body = ctor.get(
+            "body",
+            ""
+        )
+
+        focal_constructors.append(
+            f"{signature}\n{body}"
+        )
 
     for method in focal_class.get("methods", []):
 
@@ -203,9 +236,28 @@ def data_loader_node(state: AgentState) -> Dict:
             f"{signature}\n{body}"
         )
 
-    focal_context = "\n\n".join(
-        focal_methods
-    )
+    focal_context = f"""
+CLASS NAME:
+{focal_class.get("identifier", "")}
+
+PACKAGE:
+{focal_class.get("packageIdentifier", "")}
+
+SUPERCLASSES:
+{chr(10).join(focal_class.get("superclasses", []))}
+
+INTERFACES:
+{chr(10).join(focal_class.get("interfaces", []))}
+
+FIELDS:
+{chr(10).join(focal_fields)}
+
+CONSTRUCTORS:
+{chr(10).join(focal_constructors)}
+
+METHODS:
+{chr(10).join(focal_methods)}
+""".strip()
 
     # =========================================================
     # TARGET TEST BODY
@@ -222,12 +274,24 @@ TARGET TEST METHOD:
 
 
 
-FOCAL CLASS:
+FULL FOCAL CLASS CONTEXT:
 {focal_context}
 """.strip()
 
-    print("This is the code context:")
+    # =========================================================
+    # DEBUG PRINTS
+    # =========================================================
+
+    print("\n========= FULL PROMPT CONTEXT =========\n")
+
     print(prompt_context)
+
+    print("\n=======================================\n")
+
+    print(
+        f"[DEBUG] Prompt chars = "
+        f"{len(prompt_context)}"
+    )
 
     return {
         "item_id": item_id,
@@ -240,8 +304,6 @@ FOCAL CLASS:
         "method_signature": test_prefix.get("signature"),
         "is_broken": is_broken
     }
-
-
 # =============================================================================
 # GENERATION
 # =============================================================================

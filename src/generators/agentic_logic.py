@@ -682,10 +682,30 @@ STRICT RULES:
 9. NO method wrappers.
 10. NO explanation text.
 11. NO duplicate assertions.
-12. Use ONLY variables explicitly visible in TEST_SCOPE_VARIABLES.
-13. Never use focal-class methods without an object reference.
-14. Never output section headers.
-15. If uncertain, output fewer assertions.
+12. NEVER reference identifiers that are not explicitly visible
+inside TEST_SCOPE_VARIABLES.
+
+13. If TEST_SCOPE_VARIABLES is empty,
+you MUST build assertions using inline object construction
+from visible constructors.
+
+14. You MAY instantiate ONLY classes whose constructors
+are explicitly visible in FULL FOCAL CLASS CONTEXT.
+
+15. NEVER invent helper objects, factories, services,
+mocks, builders, hidden state, or undeclared variables.
+
+16. NEVER call instance methods without a receiver object.
+
+17. Inline constructor expressions are preferred over variables.
+
+18. If a valid assertion can be built from visible constructors
+and visible methods, generate it instead of returning nothing.
+
+19. Use ONLY methods, constructors, fields, and constants
+explicitly visible in the provided context.
+
+20. If uncertain, output fewer assertions.
 """
 
     system_msg = (
