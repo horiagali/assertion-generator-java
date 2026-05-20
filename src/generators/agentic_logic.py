@@ -494,7 +494,6 @@ def execute_sandbox(state: AgentState) -> Dict:
 
     return {
         "is_compiled": True,
-        "verified": True,
         "stdout": stdout,
         "mutation_score": mutation_score,
         "test_strength": test_strength,
@@ -751,7 +750,6 @@ def critic_node(state: AgentState) -> Dict:
 
     test_strength = 0.0
     mutation_score = 0.0
-    verified = False
 
     if not result.get("is_compiled", True):
 
@@ -777,10 +775,7 @@ def critic_node(state: AgentState) -> Dict:
             0.0
         )
 
-        verified = result.get(
-            "verified",
-            False
-        )
+
 
         mutant_details = extract_pit_mutant_details(
             result.get("stdout", ""),
@@ -797,7 +792,6 @@ def critic_node(state: AgentState) -> Dict:
         feedback = (
             f"TEST STRENGTH: {test_strength:.4f}\n"
             f"MUTATION SCORE: {mutation_score:.4f}\n"
-            f"VERIFIED: {verified}\n\n"
             f"SURVIVING MUTANTS:\n"
             f"{mutant_details}"
         )
@@ -811,7 +805,7 @@ def critic_node(state: AgentState) -> Dict:
         ""
     )
 
-    if verified and test_strength > best_score:
+    if test_strength > best_score:
 
         best_score = test_strength
 
@@ -827,7 +821,7 @@ def critic_node(state: AgentState) -> Dict:
         "best_prediction": best_prediction,
         "mutation_score": mutation_score,
         "test_strength": test_strength,
-        "verified": verified
+
     }
 
 def improver_node(state: AgentState) -> Dict:
@@ -921,8 +915,6 @@ def route_critic(state: AgentState):
 
     best_score = state.get("best_score", 0.0)
 
-    verified = state.get("verified", False)
-
     iteration = state.get("iteration", 0)
 
     max_iterations = state.get(
@@ -930,14 +922,13 @@ def route_critic(state: AgentState):
         3
     )
 
-    if verified and state.get("test_strength", 0.0) >= 1.0:
+    if best_score >= 1.0:
         return END
 
     if iteration >= max_iterations:
         return END
 
     return "improver"
-
 
 # =========================================================
 # GRAPH

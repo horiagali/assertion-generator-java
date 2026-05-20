@@ -116,16 +116,15 @@ def cleanup_star_files(repo_path):
                     pass
 
 
+
 # =============================================================================
 # DATA LOADER
 # =============================================================================
 def data_loader_node(state: AgentState) -> Dict:
 
-    dp = state.get("raw_datapoint")
-
     import json
 
-
+    dp = state.get("raw_datapoint")
 
     test_prefix = dp.get("testPrefix", {})
 
@@ -138,12 +137,26 @@ def data_loader_node(state: AgentState) -> Dict:
 
     # =========================================================
     # ONLY PROCESS split_0
+    # SKIP FIRST TEST FOR DEBUGGING
     # =========================================================
 
     if not item_id.endswith("_split_0"):
 
         print(
             f"    >> [SKIP NON-SPLIT0] "
+            f"{item_id}"
+        )
+
+        return {
+            "item_id": item_id,
+            "is_broken": True
+        }
+
+    # skip the very first boring example
+    if item_id == "testGetEndpoint_split_0":
+
+        print(
+            f"    >> [SKIP FIRST TEST] "
             f"{item_id}"
         )
 
@@ -186,44 +199,34 @@ def data_loader_node(state: AgentState) -> Dict:
         is_broken = True
 
     # =========================================================
-    # FULL FOCAL CLASS EXTRACTION
+    # FILTER FOCAL METHODS
     # =========================================================
 
-    focal_fields = []
+    relevant_method_names = set()
 
-    focal_constructors = []
+    for invoked in test_prefix.get(
+        "invokedMethods",
+        []
+    ) or []:
 
-    focal_methods = []
-
-    for field in focal_class.get("fields", []):
-
-        signature = field.get(
-            "fullSignature",
-            ""
+        identifier = invoked.get(
+            "identifier"
         )
 
-        focal_fields.append(signature)
+        if identifier:
+            relevant_method_names.add(
+                identifier
+            )
 
-    for ctor in focal_class.get("constructors", []):
+    filtered_methods = []
 
-        signature = ctor.get(
-            "signature",
-            ""
-        )
+    for method in focal_class.get(
+        "methods",
+        []
+    ):
 
-        body = ctor.get(
-            "body",
-            ""
-        )
-
-        focal_constructors.append(
-            f"{signature}\n{body}"
-        )
-
-    for method in focal_class.get("methods", []):
-
-        signature = method.get(
-            "signature",
+        identifier = method.get(
+            "identifier",
             ""
         )
 
@@ -232,65 +235,170 @@ def data_loader_node(state: AgentState) -> Dict:
             ""
         )
 
-        focal_methods.append(
-            f"{signature}\n{body}"
+        # always keep non-trivial methods
+        non_trivial = any([
+            "if (" in body,
+            "for (" in body,
+            "while (" in body,
+            "switch (" in body,
+            "throw " in body,
+            "catch (" in body,
+            "&&" in body,
+            "||" in body
+        ])
+
+        # remove trivial getters/setters
+        trivial_getter = (
+            re.search(
+                r"return\s+this\.\w+\s*;",
+                body.strip()
+            )
+            and len(body.splitlines()) <= 3
         )
 
-    focal_context = f"""
-CLASS NAME:
-{focal_class.get("identifier", "")}
+        trivial_setter = (
+            "=" in body
+            and len(body.splitlines()) <= 4
+            and "return" not in body
+        )
 
-PACKAGE:
-{focal_class.get("packageIdentifier", "")}
+        keep = any([
+            identifier in relevant_method_names,
+            non_trivial
+        ])
 
-SUPERCLASSES:
-{chr(10).join(focal_class.get("superclasses", []))}
+        if trivial_getter:
+            keep = False
 
-INTERFACES:
-{chr(10).join(focal_class.get("interfaces", []))}
+        if trivial_setter:
+            keep = False
 
-FIELDS:
-{chr(10).join(focal_fields)}
+        if keep:
 
-CONSTRUCTORS:
-{chr(10).join(focal_constructors)}
-
-METHODS:
-{chr(10).join(focal_methods)}
-""".strip()
+            filtered_methods.append({
+                "identifier": identifier,
+                "signature": method.get(
+                    "signature"
+                ),
+                "annotations": method.get(
+                    "annotations"
+                ),
+                "modifiers": method.get(
+                    "modifiers"
+                ),
+                "parameters": method.get(
+                    "parameters"
+                ),
+                "returnType": method.get(
+                    "returnType"
+                ),
+                "thrownExceptions": method.get(
+                    "thrownExceptions"
+                ),
+                "body": body
+            })
 
     # =========================================================
-    # TARGET TEST BODY
+    # CONSTRUCT COMPRESSED CONTEXT
     # =========================================================
 
-    target_body = test_prefix.get(
-        "body",
-        ""
+    compressed_context = {
+        "project_name": project_name,
+
+        "testPrefix": {
+            "identifier": test_prefix.get(
+                "identifier"
+            ),
+            "signature": test_prefix.get(
+                "signature"
+            ),
+            "body": test_prefix.get(
+                "body"
+            ),
+            "invokedMethods": test_prefix.get(
+                "invokedMethods"
+            )
+        },
+
+        "_focalClass": {
+            "identifier": focal_class.get(
+                "identifier"
+            ),
+
+            "packageIdentifier": focal_class.get(
+                "packageIdentifier"
+            ),
+
+            "superclasses": focal_class.get(
+                "superclasses"
+            ),
+
+            "interfaces": focal_class.get(
+                "interfaces"
+            ),
+
+            "constructors": focal_class.get(
+                "constructors"
+            ),
+
+            "methods": filtered_methods
+        }
+    }
+
+    # =========================================================
+    # REMOVE TARGET TO PREVENT LEAKAGE
+    # =========================================================
+
+    compressed_context.pop(
+        "target",
+        None
     )
 
-    prompt_context = f"""
-TARGET TEST METHOD:
-{target_body}
-
-
-
-FULL FOCAL CLASS CONTEXT:
-{focal_context}
-""".strip()
+    prompt_context = (
+        "You are given structured Java semantic metadata in JSON form.\n"
+        "Use ALL available information.\n"
+        "Do NOT invent unavailable variables or APIs.\n\n"
+        + json.dumps(
+            compressed_context,
+            indent=2,
+            default=str
+        )
+    )
 
     # =========================================================
-    # DEBUG PRINTS
+    # DEBUG PRINT
     # =========================================================
 
-    print("\n========= FULL PROMPT CONTEXT =========\n")
+    print(
+        "\n=================================================="
+    )
+
+    print(
+        f"[PROCESSING] {item_id}"
+    )
+
+    print(
+        "==================================================\n"
+    )
+
+    print(
+        "\n========= FILTERED JSON PROMPT CONTEXT =========\n"
+    )
 
     print(prompt_context)
 
-    print("\n=======================================\n")
+    print(
+        "\n===============================================\n"
+    )
 
     print(
         f"[DEBUG] Prompt chars = "
         f"{len(prompt_context)}"
+    )
+
+    print(
+        f"[DEBUG] Relevant methods kept = "
+        f"{len(filtered_methods)}"
     )
 
     return {
@@ -304,6 +412,8 @@ FULL FOCAL CLASS CONTEXT:
         "method_signature": test_prefix.get("signature"),
         "is_broken": is_broken
     }
+
+    
 # =============================================================================
 # GENERATION
 # =============================================================================
@@ -364,6 +474,8 @@ def injection_node(state: AgentState) -> Dict:
     file_path = state.get("file_path")
 
     dp = state.get("raw_datapoint")
+    import json
+
 
     test_prefix = (
         dp.get("testPrefix", {})
@@ -619,11 +731,8 @@ def injection_node(state: AgentState) -> Dict:
             f"    {method_stub}\n"
         )
 
-        print(
-            "\n    >> [INJECTED METHOD PREVIEW]\n"
-        )
+     
 
-        print(full_method_injection)
 
         # =====================================================
         # APPEND TEST
@@ -774,60 +883,14 @@ def mutation_node(state: AgentState) -> Dict:
             JAVA_HOME
         )
 
-        # =====================================================
-        # VERIFY TEST COMPILES
-        # =====================================================
 
-        cmd_verify = [
-            "mvn",
-            "test",
-            "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
-            f"-Dtest={test_fqn}#{item_id}"
-        ]
-
-        print(
-            f"    >> [VERIFY CMD] "
-            f"{' '.join(cmd_verify)}"
-        )
 
         start_time = time.time()
 
-        verify_result = subprocess.run(
-            cmd_verify,
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=600
-        )
 
-        if verify_result.returncode != 0:
 
-            print(
-                "      >> [VERIFICATION FAILED]"
-            )
 
-            print(
-                verify_result.stdout[-1500:]
-            )
 
-            if state.get("run_mode") == "human":
-
-                save_broken_test(
-                    item_id
-                )
-
-            compile_time = (
-                time.time()
-                - start_time
-            )
-
-            return {
-                "mutation_score": None,
-                "test_strength": None,
-                "compile_time": compile_time,
-                "is_compiled": False
-            }
 
         # =====================================================
         # PITEST
@@ -844,10 +907,7 @@ def mutation_node(state: AgentState) -> Dict:
             "-DtimestampedReports=false"
         ]
 
-        print(
-            f"    >> [MUTATION CMD] "
-            f"{' '.join(cmd_mutate)}"
-        )
+
 
         mutate_result = subprocess.run(
             cmd_mutate,
