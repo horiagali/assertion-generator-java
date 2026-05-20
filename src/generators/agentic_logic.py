@@ -445,6 +445,9 @@ def execute_sandbox(state: AgentState) -> Dict:
 
                 break
 
+
+    
+
     mutation_score = 0.0
     test_strength = 0.0
 
@@ -491,6 +494,7 @@ def execute_sandbox(state: AgentState) -> Dict:
 
     return {
         "is_compiled": True,
+        "verified": True,
         "stdout": stdout,
         "mutation_score": mutation_score,
         "test_strength": test_strength,
@@ -926,7 +930,7 @@ def route_critic(state: AgentState):
         3
     )
 
-    if verified and best_score >= 1.0:
+    if verified and state.get("test_strength", 0.0) >= 1.0:
         return END
 
     if iteration >= max_iterations:
