@@ -9,7 +9,7 @@ import traceback
 
 from typing import Dict
 from pathlib import Path
-
+from sandbox_utils import cleanup_star_files
 from config import (
     MUTATION_JAR_PATH,
     JAVA_HOME,
@@ -94,26 +94,7 @@ def remove_broken_test(item_id):
             )
 
 
-def cleanup_star_files(repo_path):
 
-    for root, dirs, files in os.walk(repo_path):
-
-        for file in files:
-
-            if (
-                "STAR" in file
-                and file.endswith(".java")
-            ):
-
-                try:
-
-                    os.remove(
-                        os.path.join(root, file)
-                    )
-
-                except Exception:
-
-                    pass
 
 
 
@@ -812,7 +793,23 @@ def injection_node(state: AgentState) -> Dict:
         ) as f:
 
             f.write(content)
+        print(
+            "\n========= GENERATED TEST FILE =========\n"
+        )
 
+        print(original_file)
+
+        with open(
+            original_file,
+            "r",
+            encoding="utf-8"
+        ) as debug_f:
+
+            print(debug_f.read()[:2000])
+
+        print(
+            "\n========= END GENERATED TEST FILE =========\n"
+        )
         return {
             "is_compiled": True,
             "file_path": file_path_str

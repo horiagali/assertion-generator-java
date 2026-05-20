@@ -3,13 +3,21 @@ import re
 import csv
 import subprocess
 import shutil
+from sandbox_utils import cleanup_star_files
+from pathlib import Path
+from typing import Dict
+import traceback
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+import os
+import csv
+import time
+import shutil
+import traceback
+import subprocess
 
 from pathlib import Path
 from typing import Dict
-
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-
 from state import AgentState
 
 from config import (
@@ -28,7 +36,7 @@ from config import (
 llm = ChatOpenAI(
     base_url="http://172.18.96.1:11434/v1",
     api_key="ollama",
-    model="qwen3-coder:480b-cloud",
+    model="gpt-oss:120b-cloud",
     temperature=0
 )
 
@@ -347,155 +355,44 @@ def extract_pit_mutant_details(
 
 def execute_sandbox(state: AgentState) -> Dict:
 
-    prediction = state.get("prediction", "")
-
-    project_name = state.get("project_name")
-    project_id = state.get("project_id")
-    item_id = state.get("item_id")
-
-    file_path = state.get("file_path", "")
-
-    java_bin = JAVA_HOME / "bin" / "java"
-
-    repo_path = CLONED_REPOS_DIR / str(project_name)
-
-    miner_json_path = (
-        DATA_PROJECT_DIR
-        / "scripts"
-        / "test-miner"
-        / "output"
-        / "miner"
-        / f"{project_name}.json"
-    )
-
-    # =====================================================
-    # CLEANUP
-    # =====================================================
-
-    for root, dirs, files in os.walk(repo_path):
-
-        for file in files:
-
-            if "STAR" in file and file.endswith(".java"):
-
-                try:
-                    os.remove(os.path.join(root, file))
-                except Exception:
-                    pass
-
-    pit_reports_path = repo_path / "target" / "pit-reports"
-
-    if pit_reports_path.exists():
-        shutil.rmtree(pit_reports_path)
-
-    try:
-
-        subprocess.run(
-            ["git", "checkout", "--", "src/test"],
-            cwd=str(repo_path),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-    except Exception:
-        pass
-
-    # =====================================================
-    # CLEAN ASSERTIONS
-    # =====================================================
-
-    prediction = extract_assertions_only(
-        prediction
-    )
-
-    # =====================================================
-    # INJECTION
-    # =====================================================
-
-    prediction_file = (
-        SANDBOX_DIR
-        / f"{item_id}_agentic_prediction.txt"
-    )
-
-    with open(prediction_file, "w", encoding="utf-8") as f:
-
-        f.write(f"[oracle]{prediction}[/oracle]")
-
-    cmd_inject = [
-        str(java_bin),
-        "-jar",
-        str(MUTATION_JAR_PATH),
-
-        str(project_id),
-        str(repo_path),
-        str(miner_json_path),
-
-        str(SANDBOX_DIR),
-
-        str(
-            DATA_PROJECT_DIR
-            / "scripts"
-            / "dataset"
-        ),
-
-        str(ORACLE_CONFIG_JSON),
-
-        "INFERENCE",
-        str(prediction_file)
-    ]
-
-    env = os.environ.copy()
-
-    env["JAVA_HOME"] = str(JAVA_HOME)
-
-    inject_res = subprocess.run(
-        cmd_inject,
-        cwd=str(repo_path),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600
-    )
-
-    if inject_res.returncode != 0:
+    if state.get("is_broken"):
 
         return {
-            "is_compiled": False,
-            "compile_error": (
-                "Injection failed due to invalid assertions."
-            )
+            "mutation_score": None,
+            "test_strength": None
         }
 
-    # =====================================================
-    # CLEAN EXTRA STAR FILES
-    # =====================================================
 
-    if file_path:
+    project_name = state.get("project_name")
+    file_path = state.get("file_path")
 
-        target_stem = Path(file_path).stem
-
-        for root, dirs, files in os.walk(
-            repo_path / "src" / "test"
-        ):
-
-            for file in files:
-
-                if (
-                    "STAR" in file
-                    and not file.startswith(target_stem)
-                ):
-
-                    try:
-                        os.remove(os.path.join(root, file))
-                    except Exception:
-                        pass
+    repo_path = (
+        CLONED_REPOS_DIR
+        / str(project_name)
+    )
 
     # =====================================================
-    # PIT CONFIG
+    # CLEAN OLD STAR FILES
     # =====================================================
 
-    target_tests = "*"
-    target_classes = "*"
+    cleanup_star_files(repo_path)
+
+    # =====================================================
+    # REMOVE STALE TARGET
+    # =====================================================
+
+    target_dir = repo_path / "target"
+
+    if target_dir.exists():
+
+        shutil.rmtree(target_dir)
+
+    # =====================================================
+    # BUILD PIT TARGETS
+    # =====================================================
+
+    target_classes = "*.*"
+    test_fqn = ""
 
     if file_path:
 
@@ -507,180 +404,329 @@ def execute_sandbox(state: AgentState) -> Dict:
 
         if len(parts) > 1:
 
-            class_path = parts[-1].replace(".java", "")
+            class_path = (
+                parts[-1]
+                .replace(".java", "")
+            )
 
-            test_fqn = class_path.replace("/", ".")
+            raw_test_fqn = class_path.replace(
+                "/",
+                "."
+            )
 
-            target_tests = test_fqn + "*"
+            pkg_parts = raw_test_fqn.split(".")
 
-            pkg_parts = test_fqn.split(".")
+            raw_class_name = pkg_parts[-1]
 
-            class_name = pkg_parts[-1]
+            # =====================================================
+            # NORMALIZE STAR TEST NAMES
+            # =====================================================
 
-            if class_name.endswith("STARSplitTest"):
-                class_name = class_name[:-13]
+            normalized_class_name = (
+                raw_class_name
+                .replace("STARSplit", "")
+                .replace("STAR", "")
+                .replace("Normalized", "")
+                .replace("TestTest", "Test")
+            )
+
+            # =====================================================
+            # BUILD NORMALIZED TEST FQN
+            # =====================================================
+
+            test_fqn = (
+                ".".join(pkg_parts[:-1])
+                + "."
+                + normalized_class_name
+            )
+
+            # =====================================================
+            # BUILD TARGET CLASSES
+            # =====================================================
+
+            class_name = normalized_class_name
 
             if class_name.endswith("Test"):
+
                 class_name = class_name[:-4]
 
-            if len(pkg_parts) > 1:
-
-                target_classes = (
-                    ".".join(pkg_parts[:-1])
-                    + "."
-                    + class_name
-                )
-
-            else:
-                target_classes = class_name
-
-    # =====================================================
-    # PIT EXECUTION
-    # =====================================================
-
-    cmd_mvn = [
-        "mvn",
-
-        "test-compile",
-
-        "org.pitest:pitest-maven:mutationCoverage",
-
-        "-DjvmArgs=--add-opens java.base/java.lang=ALL-UNNAMED "
-        "--add-opens java.base/java.lang.reflect=ALL-UNNAMED",
-
-        f"-DtargetClasses={target_classes}",
-        f"-DtargetTests={target_tests}",
-
-        "-Dmutators=ALL",
-
-        "-DoutputFormats=CSV",
-
-        "-DtimestampedReports=false",
-
-        "-q"
-    ]
-
-    mvn_res = subprocess.run(
-        cmd_mvn,
-        cwd=str(repo_path),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1200
-    )
-
-    stdout = mvn_res.stdout
-
-    # =====================================================
-    # COMPILE ERROR EXTRACTION
-    # =====================================================
-
-    if (
-        "Compilation failure" in stdout
-        or "COMPILATION ERROR" in stdout
-    ):
-
-        errors = []
-
-        for line in stdout.splitlines():
-
-            if (
-                "[ERROR]" in line
-                and "COMPILATION ERROR" not in line
-            ):
-
-                errors.append(line.strip())
-
-        error_msg = (
-            "\n".join(errors[:8])
-            if errors
-            else "Maven compilation failure."
-        )
-
-        return {
-            "is_compiled": False,
-            "compile_error": error_msg
-        }
-
-    # =====================================================
-    # SCORE COMPUTATION
-    # =====================================================
-
-    mutations_csv_path = None
-
-    target_dir = repo_path / "target" / "pit-reports"
-
-    if target_dir.exists():
-
-        for root, dirs, files in os.walk(target_dir):
-
-            if "mutations.csv" in files:
-
-                mutations_csv_path = (
-                    Path(root) / "mutations.csv"
-                )
-
-                break
-
-
-    
+            target_classes = (
+                ".".join(pkg_parts[:-1])
+                + "."
+                + class_name
+                + "*"
+            )
 
     mutation_score = 0.0
     test_strength = 0.0
 
-    if (
-        mutations_csv_path
-        and mutations_csv_path.exists()
-    ):
+    stdout = ""
 
-        generated = 0
-        killed = 0
 
-        with open(
-            mutations_csv_path,
-            "r",
-            encoding="utf-8"
-        ) as csvfile:
+    try:
 
-            reader = csv.reader(csvfile)
+        env = os.environ.copy()
 
-            for row in reader:
-
-                if len(row) < 6:
-                    continue
-
-                status = row[5].strip()
-
-                if status == "NO_COVERAGE":
-                    continue
-
-                generated += 1
-
-                if status in (
-                    "KILLED",
-                    "TIMED_OUT",
-                    "MEMORY_ERROR"
-                ):
-
-                    killed += 1
-
-        if generated > 0:
-
-            mutation_score = killed / generated
-            test_strength = mutation_score
-
-    return {
-        "is_compiled": True,
-        "stdout": stdout,
-        "mutation_score": mutation_score,
-        "test_strength": test_strength,
-        "mutations_csv": (
-            str(mutations_csv_path)
-            if mutations_csv_path
-            else None
+        env["JAVA_HOME"] = str(
+            JAVA_HOME
         )
-    }
 
+        compile_cmd = [
+            "mvn",
+            "test-compile",
+            "-DskipTests"
+        ]
+
+        compile_result = subprocess.run(
+            compile_cmd,
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1200
+        )
+
+        compile_stdout = (
+            compile_result.stdout
+            + "\n"
+            + compile_result.stderr
+        )
+
+
+
+        start_time = time.time()
+
+        # =====================================================
+        # PIT RUN
+        # =====================================================
+
+        cmd_mutate = [
+            "mvn",
+            "org.pitest:pitest-maven:1.16.1:mutationCoverage",
+            "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+            f"-DtargetClasses={target_classes}",
+            f"-DtargetTests={test_fqn}",
+            "-Dmutators=ALL",
+            "-DoutputFormats=CSV",
+            "-DtimestampedReports=false"
+        ]
+
+  
+
+        mutate_result = subprocess.run(
+            cmd_mutate,
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1200
+        )
+
+        compile_time = (
+            time.time()
+            - start_time
+        )
+
+        stdout = (
+            mutate_result.stdout
+            + "\n"
+            + mutate_result.stderr
+        )
+
+
+        # =====================================================
+        # DETECT FAILURE
+        # =====================================================
+
+        if (
+            mutate_result.returncode != 0
+            or "BUILD FAILURE" in stdout
+            or "COMPILATION ERROR" in stdout
+            or "[ERROR]" in stdout
+        ):
+
+            print(
+                "\n========= COMPILATION / BUILD FAILURE =========\n"
+            )
+
+            print(stdout)
+
+            print(
+                "\n========= END FAILURE OUTPUT =========\n"
+            )
+
+            return {
+                "mutation_score": 0.0,
+                "test_strength": 0.0,
+                "compile_time": compile_time,
+                "is_compiled": False,
+                "sandbox_feedback": stdout,
+                "stdout": stdout
+            }
+
+        # =====================================================
+        # PARSE PIT CSV
+        # =====================================================
+
+        pit_csv_path = (
+            repo_path
+            / "target"
+            / "pit-reports"
+            / "mutations.csv"
+        )
+
+        surviving_summary = ""
+
+        if pit_csv_path.exists():
+
+            surviving_summary = (
+                extract_pit_mutant_details(
+                    stdout,
+                    pit_csv_path
+                )
+            )
+
+            print(
+                "\n========= SURVIVING MUTANTS =========\n"
+            )
+
+            print(surviving_summary)
+
+            print(
+                "\n========= END SURVIVING MUTANTS =========\n"
+            )
+
+            # =================================================
+            # COMPUTE SCORES
+            # =================================================
+
+            generated = 0
+            killed = 0
+            no_coverage = 0
+
+            with open(
+                pit_csv_path,
+                "r",
+                encoding="utf-8"
+            ) as csvfile:
+
+                reader = csv.reader(csvfile)
+
+                for row in reader:
+
+                    if len(row) < 6:
+                        continue
+
+                    status = row[5].strip()
+
+                    generated += 1
+
+                    if status == "NO_COVERAGE":
+
+                        no_coverage += 1
+
+                    elif status in [
+                        "KILLED",
+                        "TIMED_OUT",
+                        "MEMORY_ERROR"
+                    ]:
+
+                        killed += 1
+
+            covered = (
+                generated
+                - no_coverage
+            )
+
+            mutation_score = (
+                killed / generated
+                if generated > 0
+                else 0.0
+            )
+
+            test_strength = (
+                killed / covered
+                if covered > 0
+                else mutation_score
+            )
+
+            print(
+                f"\n>> [PIT METRICS] "
+                f"Generated={generated} "
+                f"Killed={killed} "
+                f"NoCoverage={no_coverage} "
+                f"Covered={covered}"
+            )
+
+            print(
+                f">> [FINAL SCORES] "
+                f"TS={test_strength:.4f} "
+                f"MS={mutation_score:.4f}"
+            )
+
+        else:
+
+            print(
+                "\n========= mutations.csv NOT FOUND =========\n"
+            )
+
+            print(stdout)
+
+            print(
+                "\n========= END DEBUG =========\n"
+            )
+
+        return {
+            "mutation_score": float(
+                mutation_score
+            ),
+            "test_strength": float(
+                test_strength
+            ),
+            "compile_time": compile_time,
+            "is_compiled": True,
+            "sandbox_feedback": stdout,
+            "surviving_mutants": surviving_summary,
+            "stdout": stdout,
+            "mutations_csv": str(pit_csv_path)
+        }
+
+    except Exception as e:
+
+        print(
+            "\n========= SANDBOX EXCEPTION =========\n"
+        )
+
+        traceback.print_exc()
+
+        print(
+            "\n========= RAW STDOUT =========\n"
+        )
+
+        print(stdout)
+
+        print(
+            "\n========= END DEBUG =========\n"
+        )
+
+        return {
+            "mutation_score": None,
+            "test_strength": None,
+            "compile_time": 0.0,
+            "is_compiled": False,
+            "sandbox_feedback": traceback.format_exc(),
+            "stdout": stdout
+        }
+
+    finally:
+
+        cleanup_star_files(repo_path)
+
+        target_dir = repo_path / "target"
+
+        if target_dir.exists():
+
+            shutil.rmtree(target_dir)
 
 # =========================================================
 # AGENT NODES
@@ -741,6 +787,19 @@ MUTATION_HOTSPOTS:
 CONSTRAINTS:
 - ...
 
+Infer likely Builder/fluent state-construction APIs
+when constructor propagation patterns strongly imply them.
+
+Example inference pattern:
+- this.language = b.language;
+- private String language;
+
+→ likely Builder API:
+- Builder.language(String)
+
+Inferred APIs should ONLY be emitted when strongly
+supported by visible field names and constructor propagation.
+
 RULES:
 1. ONLY summarize behavior explicitly derivable from the context.
 2. NEVER invent APIs.
@@ -754,6 +813,9 @@ RULES:
 10. NO prose paragraphs.
 11. NO markdown.
 12. NO explanations outside bullet lists.
+
+
+
 """
 
     print("\n========= PROMPT CONTEXT =========\n")
@@ -851,7 +913,7 @@ def coder_node(state: AgentState) -> Dict:
 
     previous_assertions = state.get("prediction", "")
 
-    prompt = (
+    prompt = ( ""
         f"CRUCIAL CONTEXT:\n"
         f"{state['compact_prompt_context']}\n\n"
 
@@ -869,7 +931,7 @@ def coder_node(state: AgentState) -> Dict:
             f"{previous_assertions}\n\n"
         )
 
-    prompt += """
+    prompt += """ 
 TASK:
 Generate ONLY valid Java test-body code.
 
@@ -1018,14 +1080,18 @@ def critic_node(state: AgentState) -> Dict:
     print("      >> [AGENT] Executing Sandbox...")
 
     result = execute_sandbox(state)
+    print("\n========= RAW SANDBOX RESULT =========\n")
 
+    print(result)
+
+    print("\n========= END RAW SANDBOX RESULT =========\n")
     test_strength = 0.0
     mutation_score = 0.0
 
     if not result.get("is_compiled", True):
 
         compile_error = result.get(
-            "compile_error",
+            "sandbox_feedback",
             "Unknown compilation error."
         )
 
