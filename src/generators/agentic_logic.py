@@ -84,18 +84,29 @@ def clean_llm_output(text: str) -> str:
 
 
 def extract_assertions_only(text: str) -> str:
-    """
-    Keeps ONLY valid Java assertion statements.
-    Prevents model chatter from entering Java files.
-    """
 
     cleaned = []
 
-    allowed_prefixes = (
-        "assert",
-        "Assertions.",
-        "fail("
+    forbidden_prefixes = (
+        "```",
+        "Here",
+        "Explanation",
+        "The assertion",
+        "This assertion",
+        "Note:",
+        "#"
     )
+
+    forbidden_patterns = [
+        r"^\s*public\s+class",
+        r"^\s*class\s+",
+        r"^\s*import\s+",
+        r"^\s*package\s+",
+        r"^\s*@\w+",
+        r"^\s*public\s+void",
+        r"^\s*private\s+void",
+        r"^\s*protected\s+void"
+    ]
 
     for line in text.splitlines():
 
@@ -104,18 +115,35 @@ def extract_assertions_only(text: str) -> str:
         if not stripped:
             continue
 
-        if stripped.startswith("```"):
+        # remove markdown/prose
+        if stripped.startswith(
+            forbidden_prefixes
+        ):
             continue
 
-        if stripped.startswith(allowed_prefixes):
+        # remove forbidden Java structures
+        blocked = False
 
-            if not stripped.endswith(";"):
-                continue
+        for pattern in forbidden_patterns:
+
+            if re.search(pattern, stripped):
+
+                blocked = True
+                break
+
+        if blocked:
+            continue
+
+        # keep only statement-like lines
+        if (
+            stripped.endswith(";")
+            or stripped.endswith("}")
+            or stripped.endswith("{")
+        ):
 
             cleaned.append(stripped)
 
     return "\n".join(cleaned)
-
 
 # =========================================================
 # PIT FEEDBACK EXTRACTION
@@ -124,44 +152,193 @@ def extract_assertions_only(text: str) -> str:
 def extract_pit_mutant_details(
     stdout: str,
     csv_path: Path = None,
-    limit: int = 15
+    limit: int = 25
 ) -> str:
 
-    mutants = []
+    import csv
+    from collections import defaultdict
 
-    if csv_path and csv_path.exists():
+    if not csv_path or not csv_path.exists():
 
-        try:
+        return "No mutations.csv found."
 
-            with open(csv_path, "r", encoding="utf-8") as f:
+    try:
 
-                reader = csv.reader(f)
+        # =====================================================
+        # PARSE CSV
+        # =====================================================
 
-                for row in reader:
+        survived = []
 
-                    if len(row) < 6:
-                        continue
+        with open(
+            csv_path,
+            newline="",
+            encoding="utf-8"
+        ) as f:
 
-                    mutated_class = row[1].split(".")[-1]
-                    mutator = row[3]
-                    line = row[4]
-                    status = row[5].strip()
+            reader = csv.reader(f)
 
-                    if status == "SURVIVED":
+            for row in reader:
 
-                        mutants.append(
-                            f"Line {line} "
-                            f"({mutated_class}) "
-                            f"- {mutator}"
-                        )
+                if len(row) < 7:
+                    continue
 
-        except Exception:
-            pass
+                source_file = row[0]
+                mutated_class = row[1]
+                mutator = row[2]
+                method = row[3]
+                line = row[4]
+                status = row[5]
 
-    if not mutants:
-        return "No surviving mutants detected."
+                # ONLY SURVIVED MUTANTS
+                if status != "SURVIVED":
+                    continue
 
-    return "\n".join(mutants[:limit])
+                short_mutator = (
+                    mutator
+                    .split(".")[-1]
+                    .replace("Mutator", "")
+                )
+
+                survived.append({
+                    "source_file": source_file,
+                    "class": mutated_class,
+                    "method": method,
+                    "line": int(line),
+                    "mutator": short_mutator
+                })
+
+        # =====================================================
+        # EMPTY CASE
+        # =====================================================
+
+        if not survived:
+
+            return (
+                "No surviving mutants detected."
+            )
+
+        # =====================================================
+        # GROUP BY METHOD + MUTATOR
+        # =====================================================
+
+        grouped = defaultdict(list)
+
+        for mutant in survived:
+
+            key = (
+                mutant["method"],
+                mutant["mutator"]
+            )
+
+            grouped[key].append(
+                mutant["line"]
+            )
+
+        # =====================================================
+        # BUILD FEEDBACK
+        # =====================================================
+
+        feedback = []
+
+        feedback.append(
+            "SURVIVING MUTANT SUMMARY:\n"
+        )
+
+        sorted_groups = sorted(
+            grouped.items(),
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+
+        for (
+            (method, mutator),
+            lines
+        ) in sorted_groups[:limit]:
+
+            unique_lines = sorted(
+                set(lines)
+            )
+
+            feedback.append(
+                f"- Method: {method}"
+            )
+
+            feedback.append(
+                f"  Mutator: {mutator}"
+            )
+
+            feedback.append(
+                f"  Survived mutants: {len(lines)}"
+            )
+
+            feedback.append(
+                f"  Lines: {unique_lines}"
+            )
+
+            # =================================================
+            # SEMANTIC HINTS
+            # =================================================
+
+            semantic_hint = None
+
+            if "Conditional" in mutator:
+
+                semantic_hint = (
+                    "Conditional logic is weakly constrained."
+                )
+
+            elif "ReturnVals" in mutator:
+
+                semantic_hint = (
+                    "Return values are insufficiently verified."
+                )
+
+            elif "Null" in mutator:
+
+                semantic_hint = (
+                    "Null handling behavior is under-tested."
+                )
+
+            elif "Math" in mutator:
+
+                semantic_hint = (
+                    "Arithmetic behavior is weakly validated."
+                )
+
+            elif "MemberVariable" in mutator:
+
+                semantic_hint = (
+                    "Field propagation/state validation is weak."
+                )
+
+            elif "NonVoidMethodCall" in mutator:
+
+                semantic_hint = (
+                    "Method return semantics are weakly asserted."
+                )
+
+            elif "<init>" in method:
+
+                semantic_hint = (
+                    "Constructor behavior is under-constrained."
+                )
+
+            if semantic_hint:
+
+                feedback.append(
+                    f"  Insight: {semantic_hint}"
+                )
+
+            feedback.append("")
+
+        return "\n".join(feedback)
+
+    except Exception as e:
+
+        return (
+            f"Failed parsing mutations.csv: {e}"
+        )
 
 
 # =========================================================
@@ -671,44 +848,115 @@ def coder_node(state: AgentState) -> Dict:
 
     prompt += """
 TASK:
-Generate ONLY valid Java assertion statements.
+Generate ONLY valid Java test-body code.
 
-STRICT RULES:
-1. OUTPUT ONLY assertion statements.
-2. EACH line must end with ';'
-3. NO prose.
-4. NO labels.
-5. NO markdown.
-6. NO comments.
-7. NO variable declarations.
-8. NO helper methods.
-9. NO method wrappers.
-10. NO explanation text.
-11. NO duplicate assertions.
-12. NEVER reference identifiers that are not explicitly visible
-inside TEST_SCOPE_VARIABLES.
+OUTPUT REQUIREMENTS:
+1. Every semantic validation MUST use a JUnit assertion API.
+2. NEVER output naked boolean expressions.
+3. NEVER output passive method calls without assertions.
+4. EVERY generated line must compile inside the target test body.
+5. EVERY line must end with ';'
 
-13. If TEST_SCOPE_VARIABLES is empty,
-you MUST build assertions using inline object construction
-from visible constructors.
+ALLOWED ASSERTION APIS:
+- assertEquals(...)
+- assertNotEquals(...)
+- assertTrue(...)
+- assertFalse(...)
+- assertNotNull(...)
+- assertNull(...)
+- assertSame(...)
+- assertNotSame(...)
+- assertArrayEquals(...)
+- fail(...)
 
-14. You MAY instantiate ONLY classes whose constructors
-are explicitly visible in FULL FOCAL CLASS CONTEXT.
+ALLOWED CODE:
+- local variable declarations
+- inline object construction
+- method calls
+- collection/map inspection
+- intermediate values required for assertions
 
-15. NEVER invent helper objects, factories, services,
-mocks, builders, hidden state, or undeclared variables.
+FORBIDDEN CODE:
+- naked expressions like:
+  x != null;
+  foo.isEmpty();
+  a == b;
 
-16. NEVER call instance methods without a receiver object.
+- helper methods
+- classes
+- imports
+- packages
+- annotations
+- markdown
+- prose
+- comments
+- explanation text
+- method wrappers
 
-17. Inline constructor expressions are preferred over variables.
+SCOPE RULES:
+1. Use ONLY identifiers explicitly visible in:
+   - TEST_SCOPE_VARIABLES
+   - visible constructors
+   - visible methods
+   - visible constants
+   - visible fields
 
-18. If a valid assertion can be built from visible constructors
-and visible methods, generate it instead of returning nothing.
+2. NEVER invent:
+   - mocks
+   - services
+   - factories
+   - builders not explicitly visible
+   - hidden state
+   - undeclared variables
+   - unavailable APIs
 
-19. Use ONLY methods, constructors, fields, and constants
-explicitly visible in the provided context.
+3. NEVER call instance methods without a receiver object.
 
-20. If uncertain, output fewer assertions.
+4. If TEST_SCOPE_VARIABLES is empty:
+   - instantiate objects inline using ONLY visible constructors
+   - prefer inline constructor expressions over temporary variables
+
+5. You MAY instantiate ONLY classes whose constructors are explicitly visible.
+
+ASSERTION QUALITY RULES:
+1. Prefer semantic assertions over trivial assertions.
+2. Prefer exact value verification over null checks.
+3. Prefer behavioral verification over existence checks.
+4. Prefer mutation-killing assertions over broad assertions.
+5. Avoid duplicate assertions.
+6. Avoid redundant assertions.
+7. Avoid weak assertions that always pass.
+
+MUTATION-GUIDED RULES:
+1. Focus assertions on surviving mutant behavior.
+2. Strengthen validation around:
+   - return values
+   - conditionals
+   - field propagation
+   - constructor effects
+   - collection contents
+   - null handling
+
+3. If surviving mutants involve:
+   - ReturnVals mutators:
+       validate exact returned values
+
+   - Conditional mutators:
+       validate branch-sensitive behavior
+
+   - MemberVariable mutators:
+       validate propagated state and attributes
+
+   - Null mutators:
+       validate null-sensitive semantics
+
+OUTPUT FORMAT:
+- Output ONLY raw Java test-body statements.
+- No surrounding text.
+- No markdown fences.
+- No explanations.
+
+If uncertain, output fewer but stronger assertions.
 """
 
     system_msg = (
