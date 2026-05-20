@@ -152,7 +152,6 @@ def data_loader_node(state: AgentState) -> Dict:
             "is_broken": True
         }
 
-    # skip the very first boring example
     if item_id == "testGetEndpoint_split_0":
 
         print(
@@ -165,12 +164,18 @@ def data_loader_node(state: AgentState) -> Dict:
             "is_broken": True
         }
 
+    # =========================================================
+    # BASIC METADATA
+    # =========================================================
+
     project_name = dp.get(
         "_project_name",
         "dnsjava"
     )
 
-    project_id = str(project_name).split("/")[-1]
+    project_id = str(
+        project_name
+    ).split("/")[-1]
 
     file_path = dp.get(
         "_test_file_path",
@@ -199,128 +204,48 @@ def data_loader_node(state: AgentState) -> Dict:
         is_broken = True
 
     # =========================================================
-    # FILTER FOCAL METHODS
+    # TEST BODY
     # =========================================================
 
-    relevant_method_names = set()
+    test_signature = test_prefix.get(
+        "signature",
+        ""
+    )
 
-    for invoked in test_prefix.get(
+    test_body = test_prefix.get(
+        "body",
+        ""
+    )
+
+    invoked_methods = test_prefix.get(
         "invokedMethods",
         []
-    ) or []:
-
-        identifier = invoked.get(
-            "identifier"
-        )
-
-        if identifier:
-            relevant_method_names.add(
-                identifier
-            )
-
-    filtered_methods = []
-
-    for method in focal_class.get(
-        "methods",
-        []
-    ):
-
-        identifier = method.get(
-            "identifier",
-            ""
-        )
-
-        body = method.get(
-            "body",
-            ""
-        )
-
-        # always keep non-trivial methods
-        non_trivial = any([
-            "if (" in body,
-            "for (" in body,
-            "while (" in body,
-            "switch (" in body,
-            "throw " in body,
-            "catch (" in body,
-            "&&" in body,
-            "||" in body
-        ])
-
-        # remove trivial getters/setters
-        trivial_getter = (
-            re.search(
-                r"return\s+this\.\w+\s*;",
-                body.strip()
-            )
-            and len(body.splitlines()) <= 3
-        )
-
-        trivial_setter = (
-            "=" in body
-            and len(body.splitlines()) <= 4
-            and "return" not in body
-        )
-
-        keep = any([
-            identifier in relevant_method_names,
-            non_trivial
-        ])
-
-        if trivial_getter:
-            keep = False
-
-        if trivial_setter:
-            keep = False
-
-        if keep:
-
-            filtered_methods.append({
-                "identifier": identifier,
-                "signature": method.get(
-                    "signature"
-                ),
-                "annotations": method.get(
-                    "annotations"
-                ),
-                "modifiers": method.get(
-                    "modifiers"
-                ),
-                "parameters": method.get(
-                    "parameters"
-                ),
-                "returnType": method.get(
-                    "returnType"
-                ),
-                "thrownExceptions": method.get(
-                    "thrownExceptions"
-                ),
-                "body": body
-            })
+    ) or []
 
     # =========================================================
-    # CONSTRUCT COMPRESSED CONTEXT
+    # FULL RAW CONTEXT
+    # ONLY SUMMARIZER SEES THIS
     # =========================================================
 
-    compressed_context = {
+    full_context_json = {
+
         "project_name": project_name,
 
         "testPrefix": {
+
             "identifier": test_prefix.get(
                 "identifier"
             ),
-            "signature": test_prefix.get(
-                "signature"
-            ),
-            "body": test_prefix.get(
-                "body"
-            ),
-            "invokedMethods": test_prefix.get(
-                "invokedMethods"
-            )
+
+            "signature": test_signature,
+
+            "body": test_body,
+
+            "invokedMethods": invoked_methods
         },
 
         "_focalClass": {
+
             "identifier": focal_class.get(
                 "identifier"
             ),
@@ -337,36 +262,136 @@ def data_loader_node(state: AgentState) -> Dict:
                 "interfaces"
             ),
 
-            "constructors": focal_class.get(
-                "constructors"
+            "fields": focal_class.get(
+                "fields",
+                []
             ),
 
-            "methods": filtered_methods
+            "constructors": focal_class.get(
+                "constructors",
+                []
+            ),
+
+            # =================================================
+            # NO FILTERING
+            # SUMMARIZER DECIDES RELEVANCE
+            # =================================================
+
+            "methods": focal_class.get(
+                "methods",
+                []
+            )
         }
     }
 
     # =========================================================
-    # REMOVE TARGET TO PREVENT LEAKAGE
+    # PREVENT TARGET LEAKAGE
     # =========================================================
 
-    compressed_context.pop(
+    full_context_json.pop(
         "target",
         None
     )
 
-    prompt_context = (
+    # =========================================================
+    # FULL PROMPT CONTEXT
+    # ONLY FOR SUMMARIZER
+    # =========================================================
+
+    full_prompt_context = (
         "You are given structured Java semantic metadata in JSON form.\n"
         "Use ALL available information.\n"
         "Do NOT invent unavailable variables or APIs.\n\n"
         + json.dumps(
-            compressed_context,
+            full_context_json,
             indent=2,
             default=str
         )
     )
 
     # =========================================================
-    # DEBUG PRINT
+    # COMPACT EXECUTABLE CONTEXT
+    # FOR CODER / PLANNER / IMPROVER
+    # =========================================================
+
+    focal_method_signatures = []
+
+    for method in focal_class.get(
+        "methods",
+        []
+    ):
+
+        signature = method.get(
+            "signature",
+            ""
+        )
+
+        if signature:
+
+            focal_method_signatures.append(
+                f"- {signature}"
+            )
+
+    constructor_lines = []
+
+    for ctor in focal_class.get(
+        "constructors",
+        []
+    ):
+
+        signature = ctor.get(
+            "signature",
+            ""
+        )
+
+        if signature:
+
+            constructor_lines.append(
+                f"- {signature}"
+            )
+
+    field_lines = []
+
+    for field in focal_class.get(
+        "fields",
+        []
+    ):
+
+        if isinstance(field, str):
+
+            field_lines.append(
+                f"- {field}"
+            )
+
+        elif isinstance(field, dict):
+
+            signature = field.get(
+                "signature",
+                ""
+            )
+
+            if signature:
+
+                field_lines.append(
+                    f"- {signature}"
+                )
+
+    compact_prompt_context = f"""
+TARGET TEST METHOD:
+{test_body}
+
+VISIBLE FOCAL METHODS:
+{chr(10).join(focal_method_signatures)}
+
+VISIBLE CONSTRUCTORS:
+{chr(10).join(constructor_lines)}
+
+VISIBLE FIELDS:
+{chr(10).join(field_lines)}
+""".strip()
+
+    # =========================================================
+    # DEBUG PRINTS
     # =========================================================
 
     print(
@@ -382,37 +407,69 @@ def data_loader_node(state: AgentState) -> Dict:
     )
 
     print(
-        "\n========= FILTERED JSON PROMPT CONTEXT =========\n"
+        "\n========= COMPACT EXECUTABLE CONTEXT =========\n"
     )
 
-    print(prompt_context)
+    print(compact_prompt_context)
 
     print(
-        "\n===============================================\n"
-    )
-
-    print(
-        f"[DEBUG] Prompt chars = "
-        f"{len(prompt_context)}"
+        "\n==============================================\n"
     )
 
     print(
-        f"[DEBUG] Relevant methods kept = "
-        f"{len(filtered_methods)}"
+        "\n========= FULL SUMMARIZER CONTEXT =========\n"
     )
+
+    print(
+        f"[DEBUG] Full context chars = "
+        f"{len(full_prompt_context)}"
+    )
+
+    print(
+        f"[DEBUG] Total methods exposed to summarizer = "
+        f"{len(focal_class.get('methods', []))}"
+    )
+
+    print(
+        f"[DEBUG] Total constructors exposed = "
+        f"{len(focal_class.get('constructors', []))}"
+    )
+
+    print(
+        f"[DEBUG] Total fields exposed = "
+        f"{len(focal_class.get('fields', []))}"
+    )
+
+    # =========================================================
+    # RETURN STATE
+    # =========================================================
 
     return {
+
         "item_id": item_id,
+
         "project_name": project_name,
+
         "project_id": project_id,
-        "info_file_path": dp.get("_source_file_path"),
-        "prompt_context": prompt_context,
-        "ground_truth": dp.get("target"),
+
+        "info_file_path": dp.get(
+            "_source_file_path"
+        ),
+
+        "full_prompt_context": full_prompt_context,
+
+        "compact_prompt_context": compact_prompt_context,
+
+        "ground_truth": dp.get(
+            "target"
+        ),
+
         "file_path": file_path,
-        "method_signature": test_prefix.get("signature"),
+
+        "method_signature": test_signature,
+
         "is_broken": is_broken
     }
-
     
 # =============================================================================
 # GENERATION

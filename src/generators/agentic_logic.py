@@ -691,15 +691,25 @@ def summarizer_node(state: AgentState) -> Dict:
     print("      >> [AGENT] Summarizing Context...")
 
     system_msg = """
-You are a strict Java static analyzer.
+You are an expert Java mutation-testing semantic analyzer.
 
 TASK:
-Analyze ONLY the provided test method body and focal class.
+Compress the provided Java project context into ONLY the information
+required to generate high-quality mutation-killing assertions.
+
+Your summary MUST preserve:
+- executable test scope
+- visible variables
+- mutation-relevant APIs
+- state propagation paths
+- observable behaviors
+- assertion opportunities
+- branch-sensitive behaviors
+- collection/map semantics
+- null-handling semantics
+- builder propagation semantics
 
 OUTPUT FORMAT MUST BE EXACTLY:
-
-TEST_METHOD:
-...
 
 TEST_SCOPE_VARIABLES:
 - variable : type : origin
@@ -707,41 +717,54 @@ TEST_SCOPE_VARIABLES:
 FOCAL_METHODS:
 - methodSignature -> returnType
 
-VISIBLE_BEHAVIOR:
+MUTATION_RELEVANT_APIS:
 - ...
 
-ASSERTABLE_RELATIONS:
+STATE_PROPAGATION:
+- ...
+
+ASSERTABLE_BEHAVIORS:
+- ...
+
+RETURN_SEMANTICS:
+- ...
+
+COLLECTION_SEMANTICS:
 - ...
 
 NULLABILITY:
+- ...
+
+MUTATION_HOTSPOTS:
 - ...
 
 CONSTRAINTS:
 - ...
 
 RULES:
-1. ONLY use explicitly visible code.
-2. NEVER invent variables.
-3. NEVER invent constructor args.
-4. NEVER assume 'this' is the focal class.
-5. TEST_SCOPE_VARIABLES must contain ONLY variables declared in the test body.
-6. FOCAL_METHODS may contain focal-class methods.
-7. NO prose.
-8. NO explanations.
-9. NO recommendations.
-10. NO markdown.
+1. ONLY summarize behavior explicitly derivable from the context.
+2. NEVER invent APIs.
+3. NEVER invent variables.
+4. NEVER invent hidden state.
+5. Preserve builder setter methods if they affect observable outputs.
+6. Preserve methods relevant for surviving mutants.
+7. Preserve APIs needed to construct meaningful object states.
+8. Prefer semantic compression over implementation detail copying.
+9. Omit irrelevant helper methods.
+10. NO prose paragraphs.
+11. NO markdown.
+12. NO explanations outside bullet lists.
 """
 
     print("\n========= PROMPT CONTEXT =========\n")
 
-    print(state["prompt_context"])
+    print(state["full_prompt_context"])
 
     print("\n==================================\n")
 
     response = llm.invoke([
         ("system", system_msg),
-        ("human", state["prompt_context"])
-    ])
+        ("human", state["full_prompt_context"])])
 
     summary = response.content.strip()
 
@@ -796,8 +819,8 @@ RULES:
         f"MANIFEST:\n"
         f"{state.get('summary', '')}\n\n"
 
-        f"TARGET CONTEXT:\n"
-        f"{state['prompt_context']}"
+        f"CRUCIAL CONTEXT:\n"
+        f"{state['compact_prompt_context']}"
     )
 
     response = llm.invoke([
@@ -829,8 +852,8 @@ def coder_node(state: AgentState) -> Dict:
     previous_assertions = state.get("prediction", "")
 
     prompt = (
-        f"TARGET CONTEXT:\n"
-        f"{state['prompt_context']}\n\n"
+        f"CRUCIAL CONTEXT:\n"
+        f"{state['compact_prompt_context']}\n\n"
 
         f"ASSERTION MANIFEST:\n"
         f"{manifest}\n\n"
@@ -1110,6 +1133,9 @@ RULES:
 """
 
     context = (
+        f"CRUCIAL CONTEXT:\n"
+        f"{state['compact_prompt_context']}\n\n"
+
         f"MANIFEST:\n"
         f"{state.get('summary', '')}\n\n"
 

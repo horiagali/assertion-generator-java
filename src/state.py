@@ -23,7 +23,9 @@ class AgentState(TypedDict, total=False):
 
     ground_truth: str
 
-    prompt_context: str
+    full_prompt_context: str
+
+    compact_prompt_context: str
 
     # =========================================================
     # EXECUTION MODES
