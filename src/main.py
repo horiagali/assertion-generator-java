@@ -17,6 +17,17 @@ from state import AgentState
 from config import DATA_PROJECT_DIR, CLONED_REPOS_DIR
 
 # =============================================================================
+# BROKEN TEST CACHE
+# =============================================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+BROKEN_FILE = (
+    PROJECT_ROOT
+    / "data"
+    / "broken_tests.json"
+)
+
+# =============================================================================
 # GRAPH SETUP
 # =============================================================================
 
@@ -87,10 +98,217 @@ def is_valid_generated_assertion(assertion_text):
 # EVALUATION
 # =============================================================================
 
+def load_broken_tests(broken_file):
+
+    if not broken_file.exists():
+
+        return {}
+
+    try:
+
+        with open(
+            broken_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            return json.load(f)
+
+    except Exception:
+
+        return {}
+
+def save_broken_tests(
+    broken_file,
+    broken_tests
+):
+    broken_file.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with open(
+        broken_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            broken_tests,
+            f,
+            indent=4
+        )
+
+
+def evaluate_datapoint(
+    state,
+    item_id,
+    compiled_tests,
+    pit_executed
+):
+
+    start = time.time()
+
+    final = app.invoke(state)
+
+    dur = time.time() - start
+
+    if final.get("is_compiled"):
+
+        compiled_tests += 1
+
+    if (
+        final.get("mutation_score") is not None
+        or final.get(
+            "pit_metrics",
+            {}
+        ).get(
+            "generated",
+            0
+        ) > 0
+    ):
+
+        pit_executed += 1
+
+    generated_assertions = str(
+        final.get(
+            "prediction",
+            ""
+        )
+    )
+
+    return (
+        final,
+        dur,
+        generated_assertions,
+        compiled_tests,
+        pit_executed
+    )
+
+
+def is_zero_coverage_result(
+    covered_mutants,
+    pit_metrics
+):
+    return (
+        covered_mutants == 0
+        and pit_metrics.get(
+            "generated",
+            0
+        ) > 0
+    )
+
+
+def is_non_evaluable_result(
+    final,
+    covered_mutants,
+    pit_metrics
+):
+    if final.get("is_evaluable") is False:
+        return True
+
+    return (
+        not final.get(
+            "is_compiled",
+            False
+        )
+        or covered_mutants is None
+        or is_zero_coverage_result(
+            covered_mutants,
+            pit_metrics
+        )
+    )
+
+
+def update_human_filtering(
+    config,
+    item_id,
+    final,
+    covered_mutants,
+    pit_metrics,
+    broken_tests
+):
+
+    if config["run_mode"] != "human":
+
+        return
+
+    is_broken = False
+
+    if not final.get(
+        "is_compiled",
+        False
+    ):
+
+        is_broken = True
+
+        print(
+            "\n    >> [COMPILE FAILURE]"
+        )
+
+    elif is_zero_coverage_result(
+        covered_mutants,
+        pit_metrics
+    ):
+
+        is_broken = True
+
+        print(
+            "\n    >> [ZERO COVERAGE]"
+        )
+
+        print(
+            f"    >> Marking as broken/non-evaluable: "
+            f"{item_id}"
+        )
+
+    broken_tests[item_id] = is_broken
+
+
+
+def extract_metrics(final):
+
+    mutation_score = (
+        final.get(
+            "mutation_score",
+            0.0
+        )
+        if final.get(
+            "mutation_score"
+        ) is not None
+        else 0.0
+    )
+
+    test_strength = (
+        final.get(
+            "test_strength",
+            0.0
+        )
+        if final.get(
+            "test_strength"
+        ) is not None
+        else 0.0
+    )
+
+    covered_mutants = final.get(
+        "covered_mutants",
+        None
+    )
+
+    pit_metrics = final.get(
+        "pit_metrics",
+        {}
+    )
+
+    return (
+        mutation_score,
+        test_strength,
+        covered_mutants,
+        pit_metrics
+    )
+
+
 def run_evaluation(config, json_files, limit=None):
-    """
-    Runs evaluation for all datapoints.
-    """
 
     total_test_strength = 0.0
     total_mutation_score = 0.0
@@ -102,34 +320,14 @@ def run_evaluation(config, json_files, limit=None):
     skipped_broken = 0
     skipped_invalid = 0
 
-    # ============================================================
-    # DEBUG COUNTERS
-    # ============================================================
-
     total_seen = 0
     split0_seen = 0
     compiled_tests = 0
     pit_executed = 0
 
-    broken_file = (
-        DATA_PROJECT_DIR
-        / "scripts"
-        / "dataset"
-        / "output"
-        / "broken_tests.json"
+    broken_tests = load_broken_tests(
+        BROKEN_FILE
     )
-
-    broken_tests = {}
-
-    if broken_file.exists():
-
-        with open(
-            broken_file,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            broken_tests = json.load(f)
 
     for dataset_path in json_files:
 
@@ -168,15 +366,19 @@ def run_evaluation(config, json_files, limit=None):
             ).lower()
 
             if "twilio" in package_id_lower:
+
                 keyword = "twilio-java"
 
             elif "liqp" in package_id_lower:
+
                 keyword = "liqp"
 
             elif "zuul" in package_id_lower:
+
                 keyword = "zuul"
 
             else:
+
                 keyword = "dnsjava"
 
             repo_path = find_project_root(
@@ -198,11 +400,10 @@ def run_evaluation(config, json_files, limit=None):
                 {}
             )
 
-            for dp in project_obj.get("datapoints", []):
-
-                # ============================================================
-                # COUNT ALL DATAPOINTS
-                # ============================================================
+            for dp in project_obj.get(
+                "datapoints",
+                []
+            ):
 
                 total_seen += 1
 
@@ -219,34 +420,35 @@ def run_evaluation(config, json_files, limit=None):
                     )
                 )
 
-                # ============================================================
-                # ONLY PROCESS split_0
-                # ============================================================
-
-                if not item_id.endswith("_split_0"):
+                if not item_id.endswith(
+                    "_split_0"
+                ):
                     continue
 
                 split0_seen += 1
 
                 print(
-                    f"\n=================================================="
+                    f"\n{'=' * 50}"
                 )
 
                 print(
-                    f"[PROCESSING] {item_id}"
+                    f"[PROCESSING] "
+                    f"{item_id}"
                 )
 
                 print(
-                    f"==================================================\n"
+                    f"{'=' * 50}\n"
                 )
 
-                # ============================================================
-                # SKIP KNOWN BROKEN TESTS
-                # ============================================================
+                if (
+                    config["run_mode"]
+                    != "human"
+                ):
 
-                if config["run_mode"] != "human":
-
-                    if broken_tests.get(item_id, False):
+                    if broken_tests.get(
+                        item_id,
+                        False
+                    ):
 
                         skipped_broken += 1
 
@@ -267,7 +469,9 @@ def run_evaluation(config, json_files, limit=None):
                     ).lstrip("/")
                 )
 
-                dp["_project_name"] = proj_name
+                dp["_project_name"] = (
+                    proj_name
+                )
 
                 dp["_focalClass"] = (
                     parent_focal_class
@@ -275,10 +479,18 @@ def run_evaluation(config, json_files, limit=None):
 
                 state = {
                     "raw_datapoint": dp,
-                    "run_mode": config["run_mode"],
-                    "use_summarizer": config["sum"],
-                    "use_planner": config["plan"],
-                    "use_evaluator_loop": config["loop"],
+                    "run_mode": config[
+                        "run_mode"
+                    ],
+                    "use_summarizer": config[
+                        "sum"
+                    ],
+                    "use_planner": config[
+                        "plan"
+                    ],
+                    "use_evaluator_loop": config[
+                        "loop"
+                    ],
                     "iteration": 0,
                     "max_iterations": 3,
                     "feedback_history": [],
@@ -287,33 +499,17 @@ def run_evaluation(config, json_files, limit=None):
                     "test_strength": None
                 }
 
-                start = time.time()
-
-                final = app.invoke(state)
-
-                dur = time.time() - start
-
-                # ============================================================
-                # COMPILE / PIT COUNTERS
-                # ============================================================
-
-                if final.get("is_compiled"):
-
-                    compiled_tests += 1
-
-                if final.get("mutation_score") is not None:
-
-                    pit_executed += 1
-
-                # ============================================================
-                # ASSERTION VALIDATION
-                # ============================================================
-
-                generated_assertions = str(
-                    final.get(
-                        "prediction",
-                        ""
-                    )
+                (
+                    final,
+                    dur,
+                    generated_assertions,
+                    compiled_tests,
+                    pit_executed
+                ) = evaluate_datapoint(
+                    state,
+                    item_id,
+                    compiled_tests,
+                    pit_executed
                 )
 
                 if not is_valid_generated_assertion(
@@ -329,65 +525,47 @@ def run_evaluation(config, json_files, limit=None):
 
                     continue
 
-                # ============================================================
-                # SAVE BROKEN TEST RESULTS
-                # ============================================================
+                (
+                    mutation_score,
+                    test_strength,
+                    covered_mutants,
+                    pit_metrics
+                ) = extract_metrics(
+                    final
+                )
 
-                if config["run_mode"] == "human":
+                update_human_filtering(
+                    config,
+                    item_id,
+                    final,
+                    covered_mutants,
+                    pit_metrics,
+                    broken_tests
+                )
 
-                    is_broken = not final.get(
-                        "is_compiled",
-                        False
-                    )
+                if is_non_evaluable_result(
+                    final,
+                    covered_mutants,
+                    pit_metrics
+                ):
 
-                    broken_tests[item_id] = is_broken
+                    skipped_broken += 1
 
-                    with open(
-                        broken_file,
-                        "w",
-                        encoding="utf-8"
-                    ) as f:
-
-                        json.dump(
-                            broken_tests,
-                            f,
-                            indent=4
-                        )
-
-                # ============================================================
-                # METRICS
-                # ============================================================
+                    continue
 
                 processed_count += 1
 
-                total_time += dur
-
-                mutation_score = (
-                    final.get(
-                        "mutation_score",
-                        0.0
-                    )
-                    if final.get(
-                        "mutation_score"
-                    ) is not None
-                    else 0.0
-                )
-
-                test_strength = (
-                    final.get(
-                        "test_strength",
-                        0.0
-                    )
-                    if final.get(
-                        "test_strength"
-                    ) is not None
-                    else 0.0
-                )
-
                 completed_runs += 1
 
-                total_test_strength += test_strength
-                total_mutation_score += mutation_score
+                total_time += dur
+
+                total_test_strength += (
+                    test_strength
+                )
+
+                total_mutation_score += (
+                    mutation_score
+                )
 
                 running_avg_ts = (
                     total_test_strength
@@ -406,53 +584,101 @@ def run_evaluation(config, json_files, limit=None):
                     f"{test_strength:.4f} "
                     f"| Mutation Score: "
                     f"{mutation_score:.4f} "
+                    f"| Covered Mutants: "
+                    f"{covered_mutants} "
                     f"| Running Avg TS: "
                     f"{running_avg_ts:.4f} "
                     f"| Running Avg MS: "
                     f"{running_avg_ms:.4f} "
-                    f"| Time: {dur:.2f}s"
+                    f"| Time: "
+                    f"{dur:.2f}s"
                 )
 
+    if config["run_mode"] == "human":
+
+        save_broken_tests(
+            BROKEN_FILE,
+            broken_tests
+        )
+
     final_avg = (
-        total_test_strength / completed_runs
+        total_test_strength
+        / completed_runs
         if completed_runs > 0
         else 0.0
     )
 
     avg_time = (
-        total_time / processed_count
+        total_time
+        / processed_count
         if processed_count > 0
         else 0.0
     )
 
-    print("\n" + "=" * 60)
-    print("RUN SUMMARY")
-    print("=" * 60)
-
-    print(f"Total JSON Datapoints:        {total_seen}")
-    print(f"split_0 Datapoints Seen:     {split0_seen}")
-
-    print(f"Tests Successfully Compiled: {compiled_tests}")
-
-    print(f"PIT Successfully Executed:   {pit_executed}")
-
-    print(f"Completed Runs:              {completed_runs}")
-
-    print(f"Skipped Broken:              {skipped_broken}")
-
-    print(f"Skipped Invalid:             {skipped_invalid}")
+    print(
+        "\n"
+        + "=" * 60
+    )
 
     print(
-        f"Average Test Strength:       "
+        "RUN SUMMARY"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Total JSON Datapoints: "
+        f"{total_seen}"
+    )
+
+    print(
+        f"split_0 Datapoints Seen: "
+        f"{split0_seen}"
+    )
+
+    print(
+        f"Tests Successfully Compiled: "
+        f"{compiled_tests}"
+    )
+
+    print(
+        f"PIT Successfully Executed: "
+        f"{pit_executed}"
+    )
+
+    print(
+        f"Completed Runs: "
+        f"{completed_runs}"
+    )
+
+    print(
+        f"Skipped Broken: "
+        f"{skipped_broken}"
+    )
+
+    print(
+        f"Skipped Invalid: "
+        f"{skipped_invalid}"
+    )
+
+    print(
+        f"Average Test Strength: "
         f"{final_avg:.4f}"
     )
 
     print(
-        f"Average Runtime:             "
+        f"Average Runtime: "
         f"{avg_time:.2f}s"
     )
 
-    return final_avg, avg_time, completed_runs
+    return (
+        final_avg,
+        avg_time,
+        completed_runs
+    )
+
 
 
 # =============================================================================
@@ -594,7 +820,6 @@ def main():
             f"| Valid Runs: {completed} "
             f"| Avg Time: {avg_t:.2f}s"
         )
-
 
 if __name__ == "__main__":
     main()

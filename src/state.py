@@ -55,6 +55,8 @@ class AgentState(TypedDict, total=False):
 
     compile_time: float
 
+    is_evaluable: bool
+
     # =========================================================
     # MUTATION METRICS
     # =========================================================
@@ -62,6 +64,10 @@ class AgentState(TypedDict, total=False):
     mutation_score: Optional[float]
 
     test_strength: Optional[float]
+
+    covered_mutants: Optional[int]
+
+    pit_metrics: dict
 
     # =========================================================
     # AGENTIC LOOP

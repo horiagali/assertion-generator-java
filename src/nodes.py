@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import time
 import traceback
-
+from generators.agentic_logic import execute_sandbox
 from typing import Dict
 from pathlib import Path
 from sandbox_utils import cleanup_star_files
@@ -30,11 +30,11 @@ from generators.agentic_logic import run_agentic_logic
 # BROKEN TEST CACHE
 # =============================================================================
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 BROKEN_FILE = (
-    DATA_PROJECT_DIR
-    / "scripts"
-    / "dataset"
-    / "output"
+    PROJECT_ROOT
+    / "data"
     / "broken_tests.json"
 )
 
@@ -133,18 +133,6 @@ def data_loader_node(state: AgentState) -> Dict:
             "is_broken": True
         }
 
-    if item_id == "testGetEndpoint_split_0":
-
-        print(
-            f"    >> [SKIP FIRST TEST] "
-            f"{item_id}"
-        )
-
-        return {
-            "item_id": item_id,
-            "is_broken": True
-        }
-
     # =========================================================
     # BASIC METADATA
     # =========================================================
@@ -172,17 +160,17 @@ def data_loader_node(state: AgentState) -> Dict:
 
     is_broken = False
 
-    if (
-        state.get("run_mode") != "human"
-        and broken_tests.get(item_id, False)
-    ):
+    # if (
+    #     state.get("run_mode") != "human"
+    #     and broken_tests.get(item_id, False)
+    # ):
 
-        print(
-            f"    >> [BROKEN TEST SKIPPED] "
-            f"{item_id}"
-        )
+    #     print(
+    #         f"    >> [BROKEN TEST SKIPPED] "
+    #         f"{item_id}"
+    #     )
 
-        is_broken = True
+    #     is_broken = True
 
     # =========================================================
     # TEST BODY
@@ -375,51 +363,51 @@ VISIBLE FIELDS:
     # DEBUG PRINTS
     # =========================================================
 
-    print(
-        "\n=================================================="
-    )
+    # print(
+    #     "\n=================================================="
+    # )
 
-    print(
-        f"[PROCESSING] {item_id}"
-    )
+    # print(
+    #     f"[PROCESSING] {item_id}"
+    # )
 
-    print(
-        "==================================================\n"
-    )
+    # print(
+    #     "==================================================\n"
+    # )
 
-    print(
-        "\n========= COMPACT EXECUTABLE CONTEXT =========\n"
-    )
+    # print(
+    #     "\n========= COMPACT EXECUTABLE CONTEXT =========\n"
+    # )
 
-    print(compact_prompt_context)
+    # print(compact_prompt_context)
 
-    print(
-        "\n==============================================\n"
-    )
+    # print(
+    #     "\n==============================================\n"
+    # )
 
-    print(
-        "\n========= FULL SUMMARIZER CONTEXT =========\n"
-    )
+    # print(
+    #     "\n========= FULL SUMMARIZER CONTEXT =========\n"
+    # )
 
-    print(
-        f"[DEBUG] Full context chars = "
-        f"{len(full_prompt_context)}"
-    )
+    # print(
+    #     f"[DEBUG] Full context chars = "
+    #     f"{len(full_prompt_context)}"
+    # )
 
-    print(
-        f"[DEBUG] Total methods exposed to summarizer = "
-        f"{len(focal_class.get('methods', []))}"
-    )
+    # print(
+    #     f"[DEBUG] Total methods exposed to summarizer = "
+    #     f"{len(focal_class.get('methods', []))}"
+    # )
 
-    print(
-        f"[DEBUG] Total constructors exposed = "
-        f"{len(focal_class.get('constructors', []))}"
-    )
+    # print(
+    #     f"[DEBUG] Total constructors exposed = "
+    #     f"{len(focal_class.get('constructors', []))}"
+    # )
 
-    print(
-        f"[DEBUG] Total fields exposed = "
-        f"{len(focal_class.get('fields', []))}"
-    )
+    # print(
+    #     f"[DEBUG] Total fields exposed = "
+    #     f"{len(focal_class.get('fields', []))}"
+    # )
 
     # =========================================================
     # RETURN STATE
@@ -817,365 +805,110 @@ def injection_node(state: AgentState) -> Dict:
 # =============================================================================
 # MUTATION
 # =============================================================================
-
 def mutation_node(state: AgentState) -> Dict:
 
-    if state.get("is_broken"):
-
-        return {
-            "mutation_score": None,
-            "test_strength": None
-        }
-
-    if not state.get("is_compiled"):
-
-        if state.get("run_mode") == "human":
-
-            save_broken_test(
-                state.get("item_id")
-            )
-
-        return {
-            "mutation_score": None,
-            "test_strength": None,
-            "is_compiled": False
-        }
-
-    project_name = state.get("project_name")
-
-    file_path = state.get("file_path")
-
-    item_id = state.get("item_id")
-
-    repo_path = (
-        CLONED_REPOS_DIR
-        / str(project_name)
+    print(
+        "      >> [AGENT] Running Mutation Analysis..."
     )
 
-    cleanup_star_files(repo_path)
+    result = execute_sandbox(state)
 
-    target_classes = "*.*"
-
-    test_fqn = ""
-
-    # =========================================================
-    # BUILD TEST FQN
-    # =========================================================
-
-    if file_path:
-
-        parts = (
-            str(file_path)
-            .replace("\\", "/")
-            .split("src/test/java/")
-        )
-
-        if len(parts) > 1:
-
-            class_path = (
-                parts[-1]
-                .replace(".java", "")
-            )
-
-            test_fqn = class_path.replace(
-                "/",
-                "."
-            )
-
-            pkg_parts = test_fqn.split(".")
-
-            class_name = pkg_parts[-1]
-
-            if class_name.endswith("Test"):
-
-                class_name = class_name[:-4]
-
-            target_classes = (
-                ".".join(pkg_parts[:-1])
-                + "."
-                + class_name
-                + "*"
-            )
-
-    pit_reports_path = (
-        repo_path
-        / "target"
-        / "pit-reports"
+    mutation_score = result.get(
+        "mutation_score",
+        0.0
     )
 
-    if pit_reports_path.exists():
+    test_strength = result.get(
+        "test_strength",
+        0.0
+    )
 
-        shutil.rmtree(
-            pit_reports_path
+    sandbox_feedback = result.get(
+        "sandbox_feedback",
+        ""
+    )
+
+    surviving_mutants = result.get(
+        "surviving_mutants",
+        ""
+    )
+
+    covered_mutants = result.get(
+        "covered_mutants",
+        None
         )
 
-    mutation_score = 0.0
+    pit_metrics = result.get(
+        "pit_metrics",
+        {}
+    )
 
-    test_strength = 0.0
+    generated_mutants = pit_metrics.get(
+        "generated",
+        0
+    )
 
-    try:
+    # =====================================================
+    # AUTO-SKIP ZERO-COVERAGE TESTS
+    # =====================================================
 
-        env = os.environ.copy()
-
-        env["JAVA_HOME"] = str(
-            JAVA_HOME
-        )
-
-
-
-        start_time = time.time()
-
-
-
-
-
-
-        # =====================================================
-        # PITEST
-        # =====================================================
-
-        cmd_mutate = [
-            "mvn",
-            "org.pitest:pitest-maven:1.16.1:mutationCoverage",
-            "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
-            f"-DtargetClasses={target_classes}",
-            f"-DtargetTests={test_fqn}",
-            "-Dmutators=ALL",
-            "-DoutputFormats=CSV",
-            "-DtimestampedReports=false"
-        ]
-
-
-
-        mutate_result = subprocess.run(
-            cmd_mutate,
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=1200
-        )
-
-        compile_time = (
-            time.time()
-            - start_time
-        )
-
-        # =====================================================
-        # PITEST FAILURE DETECTION
-        # =====================================================
-
-        if (
-            "BUILD FAILURE" in mutate_result.stdout
-            or "BUILD FAILURE" in mutate_result.stderr
-            or "COMPILATION ERROR" in mutate_result.stdout
-            or "COMPILATION ERROR" in mutate_result.stderr
-        ):
-
-            print(
-                "\n      >> [PIT FAILURE]"
-            )
-
-            print(
-                mutate_result.stdout[-2000:]
-            )
-
-            print(
-                mutate_result.stderr[-1000:]
-            )
-
-            return {
-                "mutation_score": 0.0,
-                "test_strength": 0.0,
-                "compile_time": compile_time,
-                "is_compiled": False
-            }
-
-        # =====================================================
-        # PARSE CSV
-        # =====================================================
-
-        pit_csv_path = (
-            repo_path
-            / "target"
-            / "pit-reports"
-            / "mutations.csv"
-        )
-
-        if pit_csv_path.exists():
-
-            with open(
-                pit_csv_path,
-                "r",
-                encoding="utf-8"
-            ) as csvfile:
-
-                reader = csv.reader(
-                    csvfile
-                )
-
-                generated = 0
-                killed = 0
-                no_coverage = 0
-
-                for row in reader:
-
-                    if len(row) >= 6:
-
-                        status = row[5].strip()
-
-                        generated += 1
-
-                        if status == "NO_COVERAGE":
-
-                            no_coverage += 1
-
-                        elif status in [
-                            "KILLED",
-                            "TIMED_OUT",
-                            "MEMORY_ERROR"
-                        ]:
-
-                            killed += 1
-
-                covered = (
-                    generated
-                    - no_coverage
-                )
-
-                mutation_score = (
-                    killed / generated
-                    if generated > 0
-                    else 0.0
-                )
-
-                if covered > 0:
-
-                    test_strength = (
-                        killed / covered
-                    )
-
-                else:
-
-                    test_strength = (
-                        mutation_score
-                    )
-
-                print(
-                    f"    >> [PIT METRICS] "
-                    f"Generated={generated} "
-                    f"Killed={killed} "
-                    f"NoCoverage={no_coverage} "
-                    f"Covered={covered}"
-                )
-
-                print(
-                    f"    >> [FINAL SCORES] "
-                    f"TS={test_strength:.4f} "
-                    f"MS={mutation_score:.4f}"
-                )
-
-        else:
-
-            print(
-                "\n    >> [WARNING] "
-                "mutations.csv not found"
-            )
-
-            print(
-                mutate_result.stdout[-2000:]
-            )
-
-            print(
-                mutate_result.stderr[-1000:]
-            )
-
-        if state.get("run_mode") == "human":
-
-            remove_broken_test(item_id)
-
-        return {
-            "mutation_score": float(
-                mutation_score
-            ),
-            "test_strength": float(
-                test_strength
-            ),
-            "compile_time": compile_time,
-            "is_compiled": True
-        }
-
-    except Exception as e:
+    if (
+        state.get("run_mode") == "human"
+        and covered_mutants == 0
+        and generated_mutants > 0
+    ):
 
         print(
-            f"      >> [NODE ERROR] "
-            f"{e}"
+            "\n    >> [ZERO COVERAGE TEST DETECTED]"
         )
 
-        traceback.print_exc()
+        print(
+            f"    >> Marking as broken/non-evaluable: "
+            f"{state.get('item_id')}"
+        )
 
-        if state.get("run_mode") == "human":
-
-            save_broken_test(
-                item_id
-            )
+        save_broken_test(
+            state.get("item_id")
+        )
 
         return {
             "mutation_score": None,
             "test_strength": None,
-            "compile_time": 0.0,
-            "is_compiled": False
+            "covered_mutants": covered_mutants,
+            "compile_time": result.get(
+                "compile_time",
+                0.0
+            ),
+            "is_compiled": result.get(
+                "is_compiled",
+                True
+            ),
+            "is_evaluable": False,
+            "sandbox_feedback": sandbox_feedback,
+            "surviving_mutants": surviving_mutants,
+            "pit_metrics": pit_metrics
         }
+    return {
+        "mutation_score": mutation_score,
+        "test_strength": test_strength,
+        "covered_mutants": covered_mutants,
+        "pit_metrics": pit_metrics,
 
-    finally:
-
-        # =====================================================
-        # CLEANUP
-        # =====================================================
-
-        if file_path:
-
-            clean_cleanup_path = str(
-                file_path
+        "compile_time": result.get(
+            "compile_time",
+            0.0
+        ),
+        "is_compiled": result.get(
+            "is_compiled",
+            False
+        ),
+        "is_evaluable": (
+            covered_mutants is not None
+            and not (
+                covered_mutants == 0
+                and generated_mutants > 0
             )
-
-            if "STAR" in clean_cleanup_path:
-
-                clean_cleanup_path = re.sub(
-                    r"STAR(?:Split|Normalized)?Test",
-                    "",
-                    clean_cleanup_path
-                )
-
-                if not clean_cleanup_path.endswith(
-                    "Test.java"
-                ):
-
-                    clean_cleanup_path = (
-                        clean_cleanup_path.replace(
-                            ".java",
-                            "Test.java"
-                        )
-                    )
-
-            original_file = (
-                repo_path
-                / clean_cleanup_path
-            )
-
-            backup_file = (
-                repo_path
-                / (clean_cleanup_path + ".bak")
-            )
-
-            if backup_file.exists():
-
-                if original_file.exists():
-
-                    original_file.unlink()
-
-                backup_file.rename(
-                    original_file
-                )
-
-        cleanup_star_files(repo_path)
+        ),
+        "sandbox_feedback": sandbox_feedback,
+        "surviving_mutants": surviving_mutants
+    }

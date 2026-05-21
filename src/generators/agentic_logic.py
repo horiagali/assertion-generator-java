@@ -1,23 +1,18 @@
+import csv
 import os
 import re
-import csv
-import subprocess
 import shutil
-from sandbox_utils import cleanup_star_files
-from pathlib import Path
-from typing import Dict
+import subprocess
+import time
 import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-import os
-import csv
-import time
-import shutil
-import traceback
-import subprocess
 
-from pathlib import Path
-from typing import Dict
+from sandbox_utils import cleanup_star_files
 from state import AgentState
 
 from config import (
@@ -154,108 +149,303 @@ def extract_assertions_only(text: str) -> str:
     return "\n".join(cleaned)
 
 # =========================================================
-# PIT FEEDBACK EXTRACTION
+# PIT REPORT PARSING
 # =========================================================
+
+PIT_STATUSES = {
+    "KILLED",
+    "SURVIVED",
+    "NO_COVERAGE",
+    "TIMED_OUT",
+    "MEMORY_ERROR",
+    "NON_VIABLE",
+    "RUN_ERROR",
+}
+
+PIT_KILLED_STATUSES = {
+    "KILLED",
+    "TIMED_OUT",
+    "MEMORY_ERROR",
+}
+
+
+@dataclass
+class PitMutation:
+    source_file: str
+    mutated_class: str
+    mutator: str
+    method: str
+    line: Optional[int]
+    status: str
+    killing_test: str = ""
+
+
+@dataclass
+class PitMetrics:
+    generated: int = 0
+    killed: int = 0
+    no_coverage: int = 0
+    covered: int = 0
+    mutation_score: float = 0.0
+    test_strength: float = 0.0
+
+    def as_dict(self) -> Dict:
+        return {
+            "generated": self.generated,
+            "killed": self.killed,
+            "no_coverage": self.no_coverage,
+            "covered": self.covered,
+            "mutation_score": self.mutation_score,
+            "test_strength": self.test_strength,
+        }
+
+
+@dataclass
+class SandboxTarget:
+    repo_path: Path
+    test_file_path: str
+    target_tests: str
+    target_classes: str
+
+
+def _status_index(row: List[str]) -> Optional[int]:
+    for index, value in enumerate(row):
+        if value.strip().upper() in PIT_STATUSES:
+            return index
+
+    return None
+
+
+def _first_int(values: List[str]) -> Optional[int]:
+    for value in values:
+        stripped = value.strip()
+
+        if stripped.isdigit():
+            return int(stripped)
+
+    return None
+
+
+def _short_mutator(mutator: str) -> str:
+    return (
+        mutator
+        .split(".")[-1]
+        .replace("Mutator", "")
+    )
+
+
+def _looks_like_mutator(value: str) -> bool:
+    lower = value.lower()
+
+    return (
+        "mutator" in lower
+        or ".mutators." in lower
+    )
+
+
+def _parse_mutation_row(row: List[str]) -> Optional[PitMutation]:
+    status_idx = _status_index(row)
+
+    if status_idx is None:
+        return None
+
+    status = row[status_idx].strip().upper()
+
+    if status_idx == 5 and len(row) >= 6:
+        return PitMutation(
+            source_file=row[0].strip(),
+            mutated_class=row[1].strip(),
+            mutator=row[2].strip(),
+            method=row[3].strip(),
+            line=_first_int([row[4]]),
+            status=status,
+            killing_test=(
+                row[6].strip()
+                if len(row) > 6
+                else ""
+            ),
+        )
+
+    if status_idx >= 9 and len(row) >= 10:
+        return PitMutation(
+            source_file=row[0].strip(),
+            mutated_class=row[1].strip(),
+            method=row[2].strip(),
+            line=_first_int([row[4]]),
+            mutator=row[5].strip(),
+            status=status,
+            killing_test=(
+                row[8].strip()
+                if len(row) > 8
+                else ""
+            ),
+        )
+
+    mutator_idx = next(
+        (
+            index
+            for index, value in enumerate(row)
+            if _looks_like_mutator(value)
+        ),
+        None
+    )
+
+    return PitMutation(
+        source_file=(
+            row[0].strip()
+            if row
+            else ""
+        ),
+        mutated_class=(
+            row[1].strip()
+            if len(row) > 1
+            else ""
+        ),
+        mutator=(
+            row[mutator_idx].strip()
+            if mutator_idx is not None
+            else ""
+        ),
+        method=(
+            row[3].strip()
+            if len(row) > 3
+            else ""
+        ),
+        line=_first_int(row[:status_idx]),
+        status=status,
+        killing_test=(
+            row[status_idx + 1].strip()
+            if len(row) > status_idx + 1
+            else ""
+        ),
+    )
+
+
+def parse_pit_mutations(csv_path: Path) -> List[PitMutation]:
+    if not csv_path or not csv_path.exists():
+        return []
+
+    mutations = []
+
+    with open(
+        csv_path,
+        newline="",
+        encoding="utf-8"
+    ) as f:
+        reader = csv.reader(f)
+
+        for row in reader:
+            mutation = _parse_mutation_row(row)
+
+            if mutation:
+                mutations.append(mutation)
+
+    return mutations
+
+
+def compute_pit_metrics(
+    mutations: List[PitMutation]
+) -> PitMetrics:
+    generated = len(mutations)
+
+    killed = sum(
+        1
+        for mutation in mutations
+        if mutation.status in PIT_KILLED_STATUSES
+    )
+
+    no_coverage = sum(
+        1
+        for mutation in mutations
+        if mutation.status == "NO_COVERAGE"
+    )
+
+    covered = (
+        generated
+        - no_coverage
+    )
+
+    mutation_score = (
+        killed / generated
+        if generated > 0
+        else 0.0
+    )
+
+    test_strength = (
+        killed / covered
+        if covered > 0
+        else 0.0
+    )
+
+    return PitMetrics(
+        generated=generated,
+        killed=killed,
+        no_coverage=no_coverage,
+        covered=covered,
+        mutation_score=mutation_score,
+        test_strength=test_strength,
+    )
+
 
 def extract_pit_mutant_details(
     stdout: str,
     csv_path: Path = None,
     limit: int = 25
 ) -> str:
-
-    import csv
     from collections import defaultdict
 
-    if not csv_path or not csv_path.exists():
-
-        return "No mutations.csv found."
-
     try:
+        mutations = parse_pit_mutations(csv_path)
 
-        # =====================================================
-        # PARSE CSV
-        # =====================================================
+        if not mutations:
+            return "No mutations.csv rows found."
 
-        survived = []
-
-        with open(
-            csv_path,
-            newline="",
-            encoding="utf-8"
-        ) as f:
-
-            reader = csv.reader(f)
-
-            for row in reader:
-
-                if len(row) < 7:
-                    continue
-
-                source_file = row[0]
-                mutated_class = row[1]
-                mutator = row[2]
-                method = row[3]
-                line = row[4]
-                status = row[5]
-
-                # ONLY SURVIVED MUTANTS
-                if status != "SURVIVED":
-                    continue
-
-                short_mutator = (
-                    mutator
-                    .split(".")[-1]
-                    .replace("Mutator", "")
-                )
-
-                survived.append({
-                    "source_file": source_file,
-                    "class": mutated_class,
-                    "method": method,
-                    "line": int(line),
-                    "mutator": short_mutator
-                })
-
-        # =====================================================
-        # EMPTY CASE
-        # =====================================================
+        survived = [
+            mutation
+            for mutation in mutations
+            if mutation.status == "SURVIVED"
+        ]
 
         if not survived:
+            no_coverage_methods = sorted({
+                mutation.method
+                for mutation in mutations
+                if mutation.status == "NO_COVERAGE"
+                and mutation.method
+            })
 
-            return (
-                "No surviving mutants detected."
-            )
+            if no_coverage_methods:
+                methods = ", ".join(
+                    no_coverage_methods[:limit]
+                )
 
-        # =====================================================
-        # GROUP BY METHOD + MUTATOR
-        # =====================================================
+                return (
+                    "No surviving mutants detected.\n"
+                    "NO_COVERAGE mutants in methods: "
+                    f"{methods}"
+                )
+
+            return "No surviving mutants detected."
 
         grouped = defaultdict(list)
 
         for mutant in survived:
-
             key = (
-                mutant["method"],
-                mutant["mutator"]
+                mutant.method,
+                _short_mutator(mutant.mutator)
             )
 
             grouped[key].append(
-                mutant["line"]
+                mutant.line
             )
 
-        # =====================================================
-        # BUILD FEEDBACK
-        # =====================================================
-
-        feedback = []
-
-        feedback.append(
+        feedback = [
             "SURVIVING MUTANT SUMMARY:\n"
-        )
+        ]
 
         sorted_groups = sorted(
             grouped.items(),
-            key=lambda x: len(x[1]),
+            key=lambda item: len(item[1]),
             reverse=True
         )
 
@@ -263,10 +453,11 @@ def extract_pit_mutant_details(
             (method, mutator),
             lines
         ) in sorted_groups[:limit]:
-
-            unique_lines = sorted(
-                set(lines)
-            )
+            unique_lines = sorted({
+                line
+                for line in lines
+                if line is not None
+            })
 
             feedback.append(
                 f"- Method: {method}"
@@ -284,56 +475,38 @@ def extract_pit_mutant_details(
                 f"  Lines: {unique_lines}"
             )
 
-            # =================================================
-            # SEMANTIC HINTS
-            # =================================================
-
             semantic_hint = None
 
             if "Conditional" in mutator:
-
                 semantic_hint = (
                     "Conditional logic is weakly constrained."
                 )
-
             elif "ReturnVals" in mutator:
-
                 semantic_hint = (
                     "Return values are insufficiently verified."
                 )
-
             elif "Null" in mutator:
-
                 semantic_hint = (
                     "Null handling behavior is under-tested."
                 )
-
             elif "Math" in mutator:
-
                 semantic_hint = (
                     "Arithmetic behavior is weakly validated."
                 )
-
             elif "MemberVariable" in mutator:
-
                 semantic_hint = (
                     "Field propagation/state validation is weak."
                 )
-
             elif "NonVoidMethodCall" in mutator:
-
                 semantic_hint = (
                     "Method return semantics are weakly asserted."
                 )
-
             elif "<init>" in method:
-
                 semantic_hint = (
                     "Constructor behavior is under-constrained."
                 )
 
             if semantic_hint:
-
                 feedback.append(
                     f"  Insight: {semantic_hint}"
                 )
@@ -343,26 +516,79 @@ def extract_pit_mutant_details(
         return "\n".join(feedback)
 
     except Exception as e:
-
         return (
             f"Failed parsing mutations.csv: {e}"
         )
 
 
 # =========================================================
-# SANDBOX EXECUTION
+# SANDBOX TARGETING / EXECUTION
 # =========================================================
 
-def execute_sandbox(state: AgentState) -> Dict:
+def normalize_test_file_path(file_path: str) -> str:
+    file_path_str = str(file_path)
 
-    if state.get("is_broken"):
+    if "STAR" not in file_path_str:
+        return file_path_str
 
-        return {
-            "mutation_score": None,
-            "test_strength": None
-        }
+    file_path_str = re.sub(
+        r"STAR(?:Split|Normalized)?Test",
+        "",
+        file_path_str
+    )
+
+    if not file_path_str.endswith("Test.java"):
+        file_path_str = file_path_str.replace(
+            ".java",
+            "Test.java"
+        )
+
+    return file_path_str
 
 
+def build_test_fqn(file_path: str) -> str:
+    normalized_path = (
+        normalize_test_file_path(file_path)
+        .replace("\\", "/")
+    )
+
+    parts = normalized_path.split(
+        "src/test/java/"
+    )
+
+    if len(parts) <= 1:
+        return ""
+
+    return (
+        parts[-1]
+        .replace(".java", "")
+        .strip("/")
+        .replace("/", ".")
+    )
+
+
+def fallback_target_classes(test_fqn: str) -> str:
+    if not test_fqn:
+        return "*.*"
+
+    pkg_parts = test_fqn.split(".")
+
+    class_name = pkg_parts[-1]
+
+    if class_name.endswith("Test"):
+        class_name = class_name[:-4]
+
+    return (
+        ".".join(pkg_parts[:-1])
+        + "."
+        + class_name
+        + "*"
+    )
+
+
+def build_sandbox_target(
+    state: AgentState
+) -> SandboxTarget:
     project_name = state.get("project_name")
     file_path = state.get("file_path")
 
@@ -371,105 +597,272 @@ def execute_sandbox(state: AgentState) -> Dict:
         / str(project_name)
     )
 
-    # =====================================================
-    # CLEAN OLD STAR FILES
-    # =====================================================
+    test_file_path = normalize_test_file_path(
+        file_path
+    )
 
-    cleanup_star_files(repo_path)
+    target_tests = build_test_fqn(
+        test_file_path
+    )
 
-    # =====================================================
-    # REMOVE STALE TARGET
-    # =====================================================
+    target_classes = fallback_target_classes(
+        target_tests
+    )
 
+    return SandboxTarget(
+        repo_path=repo_path,
+        test_file_path=test_file_path,
+        target_tests=target_tests,
+        target_classes=target_classes,
+    )
+
+
+def build_maven_env() -> Dict[str, str]:
+    env = os.environ.copy()
+
+    env["JAVA_HOME"] = str(
+        JAVA_HOME
+    )
+
+    return env
+
+
+def run_maven(
+    repo_path: Path,
+    command: List[str],
+    env: Dict[str, str]
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        cwd=str(repo_path),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=1200
+    )
+
+
+def maven_output(
+    result: subprocess.CompletedProcess
+) -> str:
+    return (
+        result.stdout
+        + "\n"
+        + result.stderr
+    )
+
+
+def is_build_failure(
+    result: subprocess.CompletedProcess,
+    stdout: str
+) -> bool:
+    return (
+        result.returncode != 0
+        or "BUILD FAILURE" in stdout
+        or "COMPILATION ERROR" in stdout
+    )
+
+
+def remove_stale_target(repo_path: Path) -> None:
     target_dir = repo_path / "target"
 
     if target_dir.exists():
-
         shutil.rmtree(target_dir)
 
-    # =====================================================
-    # BUILD PIT TARGETS
-    # =====================================================
 
-    target_classes = "*.*"
-    test_fqn = ""
+def find_pit_csv(repo_path: Path) -> Optional[Path]:
+    pit_reports_path = (
+        repo_path
+        / "target"
+        / "pit-reports"
+    )
 
-    if file_path:
+    direct_path = (
+        pit_reports_path
+        / "mutations.csv"
+    )
 
-        parts = (
-            str(file_path)
-            .replace("\\", "/")
-            .split("src/test/java/")
+    if direct_path.exists():
+        return direct_path
+
+    if not pit_reports_path.exists():
+        return None
+
+    candidates = list(
+        pit_reports_path.rglob(
+            "mutations.csv"
+        )
+    )
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda path: path.stat().st_mtime
+    )
+
+
+def restore_test_backup(
+    repo_path: Path,
+    test_file_path: str
+) -> None:
+    if not test_file_path:
+        return
+
+    original_file = (
+        repo_path
+        / test_file_path
+    )
+
+    backup_file = (
+        repo_path
+        / (test_file_path + ".bak")
+    )
+
+    if not backup_file.exists():
+        return
+
+    if original_file.exists():
+        original_file.unlink()
+
+    backup_file.rename(
+        original_file
+    )
+
+
+def restore_all_test_backups(
+    repo_path: Path,
+    exclude_backup: Optional[Path] = None
+) -> None:
+    test_root = (
+        repo_path
+        / "src"
+        / "test"
+        / "java"
+    )
+
+    if not test_root.exists():
+        return
+
+    excluded = (
+        exclude_backup.resolve()
+        if exclude_backup
+        else None
+    )
+
+    for backup_file in test_root.rglob("*.java.bak"):
+        if (
+            excluded
+            and backup_file.resolve() == excluded
+        ):
+            continue
+
+        original_file = backup_file.with_suffix("")
+
+        try:
+            if original_file.exists():
+                original_file.unlink()
+
+            backup_file.rename(
+                original_file
+            )
+
+        except Exception:
+            pass
+
+
+def pitest_command(
+    target: SandboxTarget
+) -> List[str]:
+    return [
+        "mvn",
+        "org.pitest:pitest-maven:1.16.1:mutationCoverage",
+        "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+        f"-DtargetClasses={target.target_classes}",
+        f"-DtargetTests={target.target_tests}",
+        "-Dmutators=ALL",
+        "-DoutputFormats=CSV",
+        "-DtimestampedReports=false"
+    ]
+
+
+def sandbox_result(
+    metrics: PitMetrics,
+    compile_time: float,
+    is_compiled: bool,
+    sandbox_feedback: str = "",
+    surviving_mutants: str = "",
+    stdout: str = "",
+    target: Optional[SandboxTarget] = None,
+    pit_csv_path: Optional[Path] = None,
+) -> Dict:
+    mutation_score = (
+        float(metrics.mutation_score)
+        if is_compiled
+        else None
+    )
+
+    test_strength = (
+        float(metrics.test_strength)
+        if is_compiled
+        else None
+    )
+
+    result = {
+        "mutation_score": mutation_score,
+        "test_strength": test_strength,
+        "covered_mutants": metrics.covered,
+        "pit_metrics": metrics.as_dict(),
+        "compile_time": compile_time,
+        "is_compiled": is_compiled,
+        "sandbox_feedback": sandbox_feedback,
+        "surviving_mutants": surviving_mutants,
+        "stdout": stdout,
+    }
+
+    if target:
+        result.update({
+            "pit_target_classes": target.target_classes,
+            "pit_target_tests": target.target_tests,
+        })
+
+    if pit_csv_path:
+        result["pit_csv_path"] = str(
+            pit_csv_path
         )
 
-        if len(parts) > 1:
+    return result
 
-            class_path = (
-                parts[-1]
-                .replace(".java", "")
-            )
 
-            raw_test_fqn = class_path.replace(
-                "/",
-                "."
-            )
+def execute_sandbox(state: AgentState) -> Dict:
+    if state.get("is_broken"):
+        return {
+            "mutation_score": None,
+            "test_strength": None,
+            "covered_mutants": 0,
+            "pit_metrics": PitMetrics().as_dict(),
+        }
 
-            pkg_parts = raw_test_fqn.split(".")
-
-            raw_class_name = pkg_parts[-1]
-
-            # =====================================================
-            # NORMALIZE STAR TEST NAMES
-            # =====================================================
-
-            normalized_class_name = (
-                raw_class_name
-                .replace("STARSplit", "")
-                .replace("STAR", "")
-                .replace("Normalized", "")
-                .replace("TestTest", "Test")
-            )
-
-            # =====================================================
-            # BUILD NORMALIZED TEST FQN
-            # =====================================================
-
-            test_fqn = (
-                ".".join(pkg_parts[:-1])
-                + "."
-                + normalized_class_name
-            )
-
-            # =====================================================
-            # BUILD TARGET CLASSES
-            # =====================================================
-
-            class_name = normalized_class_name
-
-            if class_name.endswith("Test"):
-
-                class_name = class_name[:-4]
-
-            target_classes = (
-                ".".join(pkg_parts[:-1])
-                + "."
-                + class_name
-                + "*"
-            )
-
-    mutation_score = 0.0
-    test_strength = 0.0
-
+    target = build_sandbox_target(state)
+    active_backup = (
+        target.repo_path
+        / (target.test_file_path + ".bak")
+    )
+    metrics = PitMetrics()
     stdout = ""
-
+    compile_time = 0.0
 
     try:
-
-        env = os.environ.copy()
-
-        env["JAVA_HOME"] = str(
-            JAVA_HOME
+        restore_all_test_backups(
+            target.repo_path,
+            exclude_backup=active_backup
         )
+
+        cleanup_star_files(target.repo_path)
+        remove_stale_target(target.repo_path)
+
+        env = build_maven_env()
 
         compile_cmd = [
             "mvn",
@@ -477,49 +870,12 @@ def execute_sandbox(state: AgentState) -> Dict:
             "-DskipTests"
         ]
 
-        compile_result = subprocess.run(
-            compile_cmd,
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=1200
-        )
-
-        compile_stdout = (
-            compile_result.stdout
-            + "\n"
-            + compile_result.stderr
-        )
-
-
-
         start_time = time.time()
 
-        # =====================================================
-        # PIT RUN
-        # =====================================================
-
-        cmd_mutate = [
-            "mvn",
-            "org.pitest:pitest-maven:1.16.1:mutationCoverage",
-            "-DjvmArgs=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
-            f"-DtargetClasses={target_classes}",
-            f"-DtargetTests={test_fqn}",
-            "-Dmutators=ALL",
-            "-DoutputFormats=CSV",
-            "-DtimestampedReports=false"
-        ]
-
-  
-
-        mutate_result = subprocess.run(
-            cmd_mutate,
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=1200
+        compile_result = run_maven(
+            target.repo_path,
+            compile_cmd,
+            env
         )
 
         compile_time = (
@@ -527,26 +883,56 @@ def execute_sandbox(state: AgentState) -> Dict:
             - start_time
         )
 
-        stdout = (
-            mutate_result.stdout
-            + "\n"
-            + mutate_result.stderr
+        compile_stdout = maven_output(
+            compile_result
         )
 
-
-        # =====================================================
-        # DETECT FAILURE
-        # =====================================================
-
-        if (
-            mutate_result.returncode != 0
-            or "BUILD FAILURE" in stdout
-            or "COMPILATION ERROR" in stdout
-            or "[ERROR]" in stdout
+        if is_build_failure(
+            compile_result,
+            compile_stdout
         ):
-
             print(
                 "\n========= COMPILATION / BUILD FAILURE =========\n"
+            )
+
+            print(compile_stdout)
+
+            print(
+                "\n========= END FAILURE OUTPUT =========\n"
+            )
+
+            return sandbox_result(
+                metrics=metrics,
+                compile_time=compile_time,
+                is_compiled=False,
+                sandbox_feedback=compile_stdout,
+                stdout=compile_stdout,
+                target=target,
+            )
+
+        start_time = time.time()
+
+        mutate_result = run_maven(
+            target.repo_path,
+            pitest_command(target),
+            env
+        )
+
+        compile_time = (
+            time.time()
+            - start_time
+        )
+
+        stdout = maven_output(
+            mutate_result
+        )
+
+        if is_build_failure(
+            mutate_result,
+            stdout
+        ):
+            print(
+                "\n========= PIT / BUILD FAILURE =========\n"
             )
 
             print(stdout)
@@ -555,124 +941,24 @@ def execute_sandbox(state: AgentState) -> Dict:
                 "\n========= END FAILURE OUTPUT =========\n"
             )
 
-            return {
-                "mutation_score": 0.0,
-                "test_strength": 0.0,
-                "compile_time": compile_time,
-                "is_compiled": False,
-                "sandbox_feedback": stdout,
-                "stdout": stdout
-            }
+            return sandbox_result(
+                metrics=metrics,
+                compile_time=compile_time,
+                is_compiled=False,
+                sandbox_feedback=stdout,
+                stdout=stdout,
+                target=target,
+            )
 
-               # =====================================================
-        # PARSE PIT CSV
-        # =====================================================
-
-        pit_csv_path = (
-            repo_path
-            / "target"
-            / "pit-reports"
-            / "mutations.csv"
+        pit_csv_path = find_pit_csv(
+            target.repo_path
         )
 
-        surviving_summary = ""
-        detailed_feedback = ""
-
-        if pit_csv_path.exists():
-
-            # =================================================
-            # EXTRACT SURVIVING MUTANT DETAILS
-            # =================================================
-
-            surviving_summary = (
-                extract_pit_mutant_details(
-                    stdout,
-                    pit_csv_path
-                )
+        if not pit_csv_path:
+            feedback = (
+                "mutations.csv NOT FOUND\n\n"
+                f"{stdout}"
             )
-
-            print(
-                "\n========= SURVIVING MUTANTS =========\n"
-            )
-
-            print(surviving_summary)
-
-            print(
-                "\n========= END SURVIVING MUTANTS =========\n"
-            )
-
-            # =================================================
-            # COMPUTE RAW PIT METRICS
-            # =================================================
-
-            generated = 0
-            killed = 0
-            no_coverage = 0
-
-            with open(
-                pit_csv_path,
-                "r",
-                encoding="utf-8"
-            ) as csvfile:
-
-                reader = csv.reader(
-                    csvfile
-                )
-
-                for row in reader:
-
-                    if len(row) < 6:
-
-                        continue
-
-                    status = row[5].strip()
-
-                    generated += 1
-
-                    if status == "NO_COVERAGE":
-
-                        no_coverage += 1
-
-                    elif status in [
-                        "KILLED",
-                        "TIMED_OUT",
-                        "MEMORY_ERROR"
-                    ]:
-
-                        killed += 1
-
-            covered = (
-                generated
-                - no_coverage
-            )
-
-            mutation_score = (
-                killed / generated
-                if generated > 0
-                else 0.0
-            )
-
-            test_strength = (
-                killed / covered
-                if covered > 0
-                else mutation_score
-            )
-
-            print(
-                f"\n>> [PIT METRICS] "
-                f"Generated={generated} "
-                f"Killed={killed} "
-                f"NoCoverage={no_coverage} "
-                f"Covered={covered}"
-            )
-
-            print(
-                f">> [FINAL SCORES] "
-                f"TS={test_strength:.4f} "
-                f"MS={mutation_score:.4f}"
-            )
-
-        else:
 
             print(
                 "\n========= mutations.csv NOT FOUND =========\n"
@@ -684,58 +970,91 @@ def execute_sandbox(state: AgentState) -> Dict:
                 "\n========= END DEBUG =========\n"
             )
 
-        return {
-            "mutation_score": float(
-                mutation_score
-            ),
-            "test_strength": float(
-                test_strength
-            ),
-            "compile_time": compile_time,
-            "is_compiled": True,
-            "sandbox_feedback": detailed_feedback,
-            "surviving_mutants": surviving_summary
-        }
+            return sandbox_result(
+                metrics=metrics,
+                compile_time=compile_time,
+                is_compiled=False,
+                sandbox_feedback=feedback,
+                stdout=stdout,
+                target=target,
+            )
 
-    except Exception as e:
-
-        print(
-            "\n========= SANDBOX EXCEPTION =========\n"
+        mutations = parse_pit_mutations(
+            pit_csv_path
         )
 
-        traceback.print_exc()
-
-        print(
-            "\n========= RAW STDOUT =========\n"
+        metrics = compute_pit_metrics(
+            mutations
         )
 
-        print(stdout)
-
-        print(
-            "\n========= END DEBUG =========\n"
+        surviving_summary = extract_pit_mutant_details(
+            stdout,
+            pit_csv_path
         )
 
-        return {
-            "mutation_score": None,
-            "test_strength": None,
-            "compile_time": 0.0,
-            "is_compiled": False,
-            "sandbox_feedback": traceback.format_exc(),
-            "surviving_mutants": ""
-        }
+        print(
+            "\n========= SURVIVING MUTANTS =========\n"
+        )
+
+        print(surviving_summary)
+
+        print(
+            "\n========= END SURVIVING MUTANTS =========\n"
+        )
+
+        print(
+            f"\n>> [PIT METRICS] "
+            f"Generated={metrics.generated} "
+            f"Killed={metrics.killed} "
+            f"NoCoverage={metrics.no_coverage} "
+            f"Covered={metrics.covered}"
+        )
+
+        print(
+            f">> [FINAL SCORES] "
+            f"TS={metrics.test_strength:.4f} "
+            f"MS={metrics.mutation_score:.4f}"
+        )
+
+        return sandbox_result(
+            metrics=metrics,
+            compile_time=compile_time,
+            is_compiled=True,
+            sandbox_feedback="",
+            surviving_mutants=surviving_summary,
+            stdout=stdout,
+            target=target,
+            pit_csv_path=pit_csv_path,
+        )
+
+    except Exception:
+        return sandbox_result(
+            metrics=metrics,
+            compile_time=compile_time,
+            is_compiled=False,
+            sandbox_feedback=traceback.format_exc(),
+            surviving_mutants="",
+            stdout=stdout,
+            target=target,
+        )
 
     finally:
-
-        cleanup_star_files(repo_path)
-
-        target_dir = (
-            repo_path
-            / "target"
+        restore_test_backup(
+            target.repo_path,
+            target.test_file_path
         )
 
-        if target_dir.exists():
+        restore_all_test_backups(
+            target.repo_path
+        )
 
-            shutil.rmtree(target_dir)
+        cleanup_star_files(
+            target.repo_path
+        )
+
+        remove_stale_target(
+            target.repo_path
+        )
 # =========================================================
 # AGENT NODES
 # =========================================================
@@ -826,11 +1145,11 @@ RULES:
 
 """
 
-    print("\n========= PROMPT CONTEXT =========\n")
+    # print("\n========= PROMPT CONTEXT =========\n")
 
-    print(state["full_prompt_context"])
+    # print(state["full_prompt_context"])
 
-    print("\n==================================\n")
+    # print("\n==================================\n")
 
     response = llm.invoke([
         ("system", system_msg),
@@ -838,7 +1157,7 @@ RULES:
 
     summary = response.content.strip()
 
-    print(f"         [MANIFEST]\n{summary}\n")
+    # print(f"         [MANIFEST]\n{summary}\n")
 
     return {
         "summary": summary
@@ -900,7 +1219,7 @@ RULES:
 
     plan = response.content.strip()
 
-    print(f"         [PLAN]\n{plan}\n")
+    # print(f"         [PLAN]\n{plan}\n")
 
     return {
         "plan": plan
@@ -909,7 +1228,7 @@ RULES:
 
 def coder_node(state: AgentState) -> Dict:
 
-    print("      >> [AGENT] Generating Assertions...")
+    # print("      >> [AGENT] Generating Assertions...")
 
     manifest = state.get("summary", "")
 
