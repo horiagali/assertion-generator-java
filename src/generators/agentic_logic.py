@@ -617,6 +617,265 @@ def build_sandbox_target(
     )
 
 
+def clean_prediction_body(prediction: str) -> str:
+    cleaned_prediction = prediction.strip()
+
+    if re.search(
+        r'(?:public\s+|private\s+)?void\s+\w+\s*\([^)]*\)\s*\{',
+        cleaned_prediction
+    ):
+        start_idx = cleaned_prediction.find('{')
+        end_idx = cleaned_prediction.rfind('}')
+
+        if (
+            start_idx != -1
+            and end_idx != -1
+            and end_idx > start_idx
+        ):
+            cleaned_prediction = (
+                cleaned_prediction[
+                    start_idx + 1:end_idx
+                ].strip()
+            )
+
+    return cleaned_prediction
+
+
+def assertion_static_import(content: str) -> str:
+    is_junit5 = (
+        "jupiter" in content
+        or "org.junit.jupiter" in content
+    )
+
+    if is_junit5:
+        return (
+            "\nimport static "
+            "org.junit.jupiter.api.Assertions.*;"
+        )
+
+    return (
+        "\nimport static "
+        "org.junit.Assert.*;"
+    )
+
+
+def add_assertion_imports(content: str) -> str:
+    static_imports = assertion_static_import(
+        content
+    )
+
+    if static_imports in content:
+        return content
+
+    package_match = re.search(
+        r'package\s+[\w.]+;',
+        content
+    )
+
+    if package_match:
+        return content.replace(
+            package_match.group(0),
+            package_match.group(0)
+            + static_imports
+        )
+
+    return (
+        static_imports
+        + "\n"
+        + content
+    )
+
+
+def build_injected_method(
+    state: AgentState,
+    prediction: str
+) -> str:
+    dp = state.get("raw_datapoint") or {}
+
+    test_prefix = dp.get(
+        "testPrefix",
+        {}
+    )
+
+    method_body = test_prefix.get(
+        "body",
+        ""
+    )
+
+    cleaned_prediction = clean_prediction_body(
+        prediction
+    )
+
+    pattern = re.compile(
+        r'/\*.*?MASK_PLACEHOLDER.*?\*/'
+    )
+
+    if pattern.search(method_body):
+        method_stub = pattern.sub(
+            cleaned_prediction,
+            method_body
+        )
+    else:
+        method_stub = (
+            method_body
+            .replace(
+                "/*<MASK_PLACEHOLDER>*/",
+                cleaned_prediction
+            )
+            .replace(
+                "/*MASK_PLACEHOLDER*/",
+                cleaned_prediction
+            )
+        )
+
+    return (
+        f"\n    @Test\n"
+        f"    {method_stub}\n"
+    )
+
+
+def reset_repo_test_file(
+    repo_path: Path,
+    test_file_path: str
+) -> None:
+    original_file = (
+        repo_path
+        / test_file_path
+    )
+
+    if not original_file.exists():
+        return
+
+    try:
+        relative_git_path = original_file.relative_to(
+            repo_path
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "checkout",
+                "HEAD",
+                "--",
+                str(relative_git_path)
+            ],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True
+        )
+
+    except Exception as e:
+        print(
+            f"    >> [GIT WARNING] "
+            f"{e}"
+        )
+
+
+def inject_prediction_into_test_file(
+    state: AgentState
+) -> Dict:
+    prediction = state.get("prediction")
+
+    if not prediction:
+        return {
+            "is_compiled": False,
+            "sandbox_feedback": "Missing prediction."
+        }
+
+    target = build_sandbox_target(state)
+    repo_path = target.repo_path
+    test_file_path = target.test_file_path
+
+    restore_all_test_backups(
+        repo_path
+    )
+
+    cleanup_star_files(repo_path)
+    reset_repo_test_file(
+        repo_path,
+        test_file_path
+    )
+
+    original_file = (
+        repo_path
+        / test_file_path
+    )
+
+    print(
+        f"    >> [INJECTION TARGET] "
+        f"{original_file}"
+    )
+
+    if not original_file.exists():
+        return {
+            "is_compiled": False,
+            "sandbox_feedback": (
+                "Original test file not found at path: "
+                f"{original_file}"
+            )
+        }
+
+    try:
+        backup_file = (
+            repo_path
+            / (test_file_path + ".bak")
+        )
+
+        shutil.copyfile(
+            original_file,
+            backup_file
+        )
+
+        with open(
+            original_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            content = f.read()
+
+        content = re.sub(
+            r'@Test\b',
+            '// @Test',
+            content
+        )
+
+        content = add_assertion_imports(
+            content
+        )
+
+        full_method_injection = build_injected_method(
+            state,
+            prediction
+        )
+
+        rbrace_idx = content.rfind('}')
+
+        if rbrace_idx != -1:
+            content = (
+                content[:rbrace_idx]
+                + full_method_injection
+                + content[rbrace_idx:]
+            )
+
+        with open(
+            original_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            f.write(content)
+
+        return {
+            "is_compiled": True,
+            "file_path": test_file_path
+        }
+
+    except Exception:
+        return {
+            "is_compiled": False,
+            "sandbox_feedback": traceback.format_exc()
+        }
+
+
 def build_maven_env() -> Dict[str, str]:
     env = os.environ.copy()
 
@@ -891,15 +1150,15 @@ def execute_sandbox(state: AgentState) -> Dict:
             compile_result,
             compile_stdout
         ):
-            print(
-                "\n========= COMPILATION / BUILD FAILURE =========\n"
-            )
+            # print(
+            #     "\n========= COMPILATION / BUILD FAILURE =========\n"
+            # )
 
-            print(compile_stdout)
+            # print(compile_stdout)
 
-            print(
-                "\n========= END FAILURE OUTPUT =========\n"
-            )
+            # print(
+            #     "\n========= END FAILURE OUTPUT =========\n"
+            # )
 
             return sandbox_result(
                 metrics=metrics,
@@ -931,15 +1190,15 @@ def execute_sandbox(state: AgentState) -> Dict:
             mutate_result,
             stdout
         ):
-            print(
-                "\n========= PIT / BUILD FAILURE =========\n"
-            )
+            # print(
+            #     "\n========= PIT / BUILD FAILURE =========\n"
+            # )
 
-            print(stdout)
+            # print(stdout)
 
-            print(
-                "\n========= END FAILURE OUTPUT =========\n"
-            )
+            # print(
+            #     "\n========= END FAILURE OUTPUT =========\n"
+            # )
 
             return sandbox_result(
                 metrics=metrics,
@@ -1406,7 +1665,27 @@ def critic_node(state: AgentState) -> Dict:
 
     print("      >> [AGENT] Executing Sandbox...")
 
-    result = execute_sandbox(state)
+    injection_result = inject_prediction_into_test_file(
+        state
+    )
+
+    if not injection_result.get(
+        "is_compiled",
+        False
+    ):
+        result = {
+            "is_compiled": False,
+            "mutation_score": None,
+            "test_strength": None,
+            "sandbox_feedback": injection_result.get(
+                "sandbox_feedback",
+                "Failed to inject prediction."
+            ),
+            "surviving_mutants": "",
+            "pit_metrics": {},
+        }
+    else:
+        result = execute_sandbox(state)
 
     test_strength = 0.0
     mutation_score = 0.0
@@ -1425,14 +1704,20 @@ def critic_node(state: AgentState) -> Dict:
 
     else:
 
-        mutation_score = result.get(
-            "mutation_score",
-            0.0
+        mutation_score = (
+            result.get(
+                "mutation_score",
+                0.0
+            )
+            or 0.0
         )
 
-        test_strength = result.get(
-            "test_strength",
-            0.0
+        test_strength = (
+            result.get(
+                "test_strength",
+                0.0
+            )
+            or 0.0
         )
 
 
@@ -1454,6 +1739,24 @@ def critic_node(state: AgentState) -> Dict:
 
     print(f"         [CRITIC]\n{feedback}\n")
 
+    feedback_signature = (
+        f"{result.get('is_compiled', False)}|"
+        f"{test_strength:.6f}|"
+        f"{mutation_score:.6f}|"
+        f"{result.get('surviving_mutants', '')}"
+    )
+
+    previous_signature = state.get(
+        "latest_feedback_signature",
+        ""
+    )
+
+    plateau_count = (
+        state.get("plateau_count", 0) + 1
+        if previous_signature == feedback_signature
+        else 0
+    )
+
     best_score = state.get("best_score", 0.0)
 
     best_prediction = state.get(
@@ -1473,6 +1776,8 @@ def critic_node(state: AgentState) -> Dict:
     return {
         "iteration": state.get("iteration", 0) + 1,
         "latest_feedback": feedback,
+        "latest_feedback_signature": feedback_signature,
+        "plateau_count": plateau_count,
         "best_score": best_score,
         "best_prediction": best_prediction,
         "mutation_score": mutation_score,
@@ -1576,12 +1881,25 @@ def route_critic(state: AgentState):
 
     iteration = state.get("iteration", 0)
 
+    plateau_count = state.get(
+        "plateau_count",
+        0
+    )
+
     max_iterations = state.get(
         "max_iterations",
         3
     )
 
     if best_score >= 1.0:
+        return END
+
+    if plateau_count >= 1:
+        print(
+            "      >> [AGENT] "
+            "Stopping refinement: sandbox feedback plateau."
+        )
+
         return END
 
     if iteration >= max_iterations:
@@ -1666,15 +1984,19 @@ def run_agentic_logic(state: AgentState) -> Dict:
     state["best_score"] = 0.0
     state["best_prediction"] = ""
     state["iteration"] = 0
+    state["plateau_count"] = 0
+    state["latest_feedback_signature"] = ""
     state["is_compiled"] = False
 
     final_state = agent_app.invoke(state)
 
+    best_prediction = (
+        final_state.get("best_prediction")
+        or final_state.get("prediction", "")
+    )
+
     return {
-        "prediction": final_state.get(
-            "best_prediction",
-            final_state.get("prediction", "")
-        ),
+        "prediction": best_prediction,
 
         "mutation_score": final_state.get(
             "mutation_score",

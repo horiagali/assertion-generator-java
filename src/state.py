@@ -81,4 +81,10 @@ class AgentState(TypedDict, total=False):
 
     critic_feedback: str
 
+    latest_feedback: str
+
+    latest_feedback_signature: str
+
+    plateau_count: int
+
     best_score: float

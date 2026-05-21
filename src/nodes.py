@@ -6,7 +6,10 @@ import shutil
 import subprocess
 import time
 import traceback
-from generators.agentic_logic import execute_sandbox
+from generators.agentic_logic import (
+    execute_sandbox,
+    inject_prediction_into_test_file
+)
 from typing import Dict
 from pathlib import Path
 from sandbox_utils import cleanup_star_files
@@ -523,283 +526,19 @@ def injection_node(state: AgentState) -> Dict:
             "is_compiled": False
         }
 
-    repo_path = (
-        CLONED_REPOS_DIR
-        / str(project_name)
+    result = inject_prediction_into_test_file(
+        state
     )
 
-    cleanup_star_files(repo_path)
-
-    file_path_str = str(file_path)
-
-    # =========================================================
-    # STAR FILE NORMALIZATION
-    # =========================================================
-
-    if "STAR" in file_path_str:
-
-        file_path_str = re.sub(
-            r"STAR(?:Split|Normalized)?Test",
-            "",
-            file_path_str
+    if (
+        not result.get("is_compiled", False)
+        and state.get("run_mode") == "human"
+    ):
+        save_broken_test(
+            state.get("item_id")
         )
 
-        if not file_path_str.endswith(
-            "Test.java"
-        ):
-
-            file_path_str = file_path_str.replace(
-                ".java",
-                "Test.java"
-            )
-
-    original_file = (
-        repo_path
-        / file_path_str
-    )
-
-    print(
-        f"    >> [INJECTION TARGET] "
-        f"{original_file}"
-    )
-
-    # =========================================================
-    # HARD RESET TEST FILE
-    # =========================================================
-
-    if original_file.exists():
-
-        try:
-
-            relative_git_path = (
-                original_file.relative_to(
-                    repo_path
-                )
-            )
-
-            subprocess.run(
-                [
-                    "git",
-                    "checkout",
-                    "HEAD",
-                    "--",
-                    str(relative_git_path)
-                ],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True
-            )
-
-        except Exception as e:
-
-            print(
-                f"    >> [GIT WARNING] "
-                f"{e}"
-            )
-
-    if not original_file.exists():
-
-        print(
-            f"    [ERROR] Original test file "
-            f"not found at path: "
-            f"{original_file}"
-        )
-
-        return {
-            "is_compiled": False
-        }
-
-    try:
-
-        # =====================================================
-        # BACKUP
-        # =====================================================
-
-        backup_file = (
-            repo_path
-            / (str(file_path_str) + ".bak")
-        )
-
-        shutil.copyfile(
-            original_file,
-            backup_file
-        )
-
-        with open(
-            original_file,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            content = f.read()
-
-        # =====================================================
-        # DISABLE ALL OTHER TESTS
-        # =====================================================
-
-        content = re.sub(
-            r'@Test\b',
-            '// @Test',
-            content
-        )
-
-        # =====================================================
-        # ASSERT IMPORTS
-        # =====================================================
-
-        is_junit5 = (
-            "jupiter" in content
-            or "org.junit.jupiter" in content
-        )
-
-        if is_junit5:
-
-            static_imports = (
-                "\nimport static "
-                "org.junit.jupiter.api.Assertions.*;"
-            )
-
-        else:
-
-            static_imports = (
-                "\nimport static "
-                "org.junit.Assert.*;"
-            )
-
-        if static_imports not in content:
-
-            package_match = re.search(
-                r'package\s+[\w.]+;',
-                content
-            )
-
-            if package_match:
-
-                content = content.replace(
-                    package_match.group(0),
-                    package_match.group(0)
-                    + static_imports
-                )
-
-            else:
-
-                content = (
-                    static_imports
-                    + "\n"
-                    + content
-                )
-
-        # =====================================================
-        # CLEAN GENERATED OUTPUT
-        # =====================================================
-
-        cleaned_prediction = (
-            prediction.strip()
-        )
-
-        if re.search(
-            r'(?:public\s+|private\s+)?void\s+\w+\s*\([^)]*\)\s*\{',
-            cleaned_prediction
-        ):
-
-            start_idx = cleaned_prediction.find('{')
-
-            end_idx = cleaned_prediction.rfind('}')
-
-            if (
-                start_idx != -1
-                and end_idx != -1
-                and end_idx > start_idx
-            ):
-
-                cleaned_prediction = (
-                    cleaned_prediction[
-                        start_idx + 1:end_idx
-                    ].strip()
-                )
-
-        # =====================================================
-        # INJECT ASSERTIONS INTO MASK
-        # =====================================================
-
-        method_body = test_prefix.get(
-            "body",
-            ""
-        )
-
-        pattern = re.compile(
-            r'/\*.*?MASK_PLACEHOLDER.*?\*/'
-        )
-
-        if pattern.search(method_body):
-
-            method_stub = pattern.sub(
-                cleaned_prediction,
-                method_body
-            )
-
-        else:
-
-            method_stub = (
-                method_body
-                .replace(
-                    "/*<MASK_PLACEHOLDER>*/",
-                    cleaned_prediction
-                )
-                .replace(
-                    "/*MASK_PLACEHOLDER*/",
-                    cleaned_prediction
-                )
-            )
-
-        full_method_injection = (
-            f"\n    @Test\n"
-            f"    {method_stub}\n"
-        )
-
-     
-
-
-        # =====================================================
-        # APPEND TEST
-        # =====================================================
-
-        rbrace_idx = content.rfind('}')
-
-        if rbrace_idx != -1:
-
-            content = (
-                content[:rbrace_idx]
-                + full_method_injection
-                + content[rbrace_idx:]
-            )
-
-        with open(
-            original_file,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(content)
-
-        return {
-            "is_compiled": True,
-            "file_path": file_path_str
-        }
-
-    except Exception:
-
-        traceback.print_exc()
-
-        if state.get("run_mode") == "human":
-
-            save_broken_test(
-                state.get("item_id")
-            )
-
-        return {
-            "is_compiled": False
-        }
+    return result
 
 
 # =============================================================================
