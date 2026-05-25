@@ -148,7 +148,7 @@ def evaluate_datapoint(
 ):
 
     start = time.time()
-
+    print(f"################ New datapoint #{compiled_tests}   #################")
     final = app.invoke(state)
 
     dur = time.time() - start

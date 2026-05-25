@@ -35,49 +35,6 @@ llm = ChatOpenAI(
     temperature=0
 )
 
-# =========================================================
-# ASSERTION HELPERS
-# =========================================================
-
-def normalize_assertions(text: str) -> list[str]:
-
-    cleaned = []
-
-    for line in text.splitlines():
-
-        stripped = line.strip()
-
-        if not stripped:
-            continue
-
-        if stripped.startswith("```"):
-            continue
-
-        if stripped not in cleaned:
-            cleaned.append(stripped)
-
-    return cleaned
-
-
-def merge_assertions(
-    previous_assertions: str,
-    new_assertions: str
-) -> str:
-
-    previous = normalize_assertions(previous_assertions)
-
-    new = normalize_assertions(new_assertions)
-
-    merged = list(previous)
-
-    for assertion in new:
-
-        if assertion not in merged:
-            merged.append(assertion)
-
-    return "\n".join(merged)
-
-
 def clean_llm_output(text: str) -> str:
 
     text = text.replace("```java", "")
@@ -1497,7 +1454,7 @@ def coder_node(state: AgentState) -> Dict:
         or ""
     )
 
-    previous_assertions = state.get("prediction", "")
+    previous_code = state.get("prediction", "")
 
     prompt = ( ""
         f"CRUCIAL CONTEXT:\n"
@@ -1510,16 +1467,20 @@ def coder_node(state: AgentState) -> Dict:
         f"{strategy}\n\n"
     )
 
-    if previous_assertions:
+    if previous_code:
 
         prompt += (
-            f"PREVIOUS ASSERTIONS:\n"
-            f"{previous_assertions}\n\n"
+            f"PREVIOUS CODE (FOR REFERENCE/FIXING):\n"
+            f"{previous_code}\n\n"
         )
 
     prompt += """ 
 TASK:
 Generate ONLY valid Java test-body code.
+Write the COMPLETE, fully corrected assertion block.
+If previous code caused a compilation or runtime failure,
+REMOVE or FIX the failing lines.
+The output replaces the entire previous assertion block.
 
 OUTPUT REQUIREMENTS:
 1. Every semantic validation MUST use a JUnit assertion API.
@@ -1639,26 +1600,12 @@ If uncertain, output fewer but stronger assertions.
         ("human", prompt)
     ])
 
-    raw_output = clean_llm_output(
+    new_prediction = clean_llm_output(
         response.content
     )
 
-    raw_output = extract_assertions_only(
-        raw_output
-    )
-
-    combined_assertions = merge_assertions(
-        previous_assertions,
-        raw_output
-    )
-
-    print(
-        f"         [ASSERTIONS]\n"
-        f"{combined_assertions}\n"
-    )
-
     return {
-        "prediction": combined_assertions
+        "prediction": new_prediction
     }
 
 def critic_node(state: AgentState) -> Dict:
