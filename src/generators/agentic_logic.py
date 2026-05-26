@@ -2040,6 +2040,25 @@ RULES:
     }
 
 
+def downstream_context_block(state: AgentState) -> str:
+    if state.get("use_summarizer"):
+        return (
+            f"CRUCIAL CONTEXT:\n"
+            f"{state['compact_prompt_context']}\n\n"
+
+            f"ASSERTION MANIFEST:\n"
+            f"{state.get('summary', '')}"
+        )
+
+    return (
+        "FULL RAW CONTEXT (SUMMARIZER DISABLED):\n"
+        f"{state['full_prompt_context']}\n\n"
+
+        "COMPACT EXECUTABLE CONTEXT:\n"
+        f"{state['compact_prompt_context']}"
+    )
+
+
 def planner_node(state: AgentState) -> Dict:
 
     print("      >> [AGENT] Planning Assertions...")
@@ -2080,12 +2099,8 @@ RULES:
 8. Prefer exact semantic checks over null checks.
 """
 
-    context = (
-        f"MANIFEST:\n"
-        f"{state.get('summary', '')}\n\n"
-
-        f"CRUCIAL CONTEXT:\n"
-        f"{state['compact_prompt_context']}"
+    context = downstream_context_block(
+        state
     )
 
     response = llm.invoke([
@@ -2106,8 +2121,6 @@ def coder_node(state: AgentState) -> Dict:
 
     # print("      >> [AGENT] Generating Assertions...")
 
-    manifest = state.get("summary", "")
-
     strategy = (
         state.get("improvement_plan")
         or state.get("plan")
@@ -2116,12 +2129,8 @@ def coder_node(state: AgentState) -> Dict:
 
     previous_code = state.get("prediction", "")
 
-    prompt = ( ""
-        f"CRUCIAL CONTEXT:\n"
-        f"{state['compact_prompt_context']}\n\n"
-
-        f"ASSERTION MANIFEST:\n"
-        f"{manifest}\n\n"
+    prompt = (
+        f"{downstream_context_block(state)}\n\n"
 
         f"ASSERTION STRATEGY:\n"
         f"{strategy}\n\n"
@@ -2495,11 +2504,7 @@ RULES:
 """
 
     context = (
-        f"CRUCIAL CONTEXT:\n"
-        f"{state['compact_prompt_context']}\n\n"
-
-        f"MANIFEST:\n"
-        f"{state.get('summary', '')}\n\n"
+        f"{downstream_context_block(state)}\n\n"
 
         f"PREVIOUS ASSERTIONS:\n"
         f"{state.get('prediction', '')}\n\n"
