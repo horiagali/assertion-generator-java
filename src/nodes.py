@@ -567,6 +567,21 @@ def mutation_node(state: AgentState) -> Dict:
         ""
     )
 
+    compile_error = result.get(
+        "compile_error",
+        ""
+    )
+
+    test_failure = result.get(
+        "test_failure",
+        ""
+    )
+
+    failure_stage = result.get(
+        "failure_stage",
+        ""
+    )
+
     surviving_mutants = result.get(
         "surviving_mutants",
         ""
@@ -623,6 +638,9 @@ def mutation_node(state: AgentState) -> Dict:
                 True
             ),
             "is_evaluable": False,
+            "compile_error": compile_error,
+            "test_failure": test_failure,
+            "failure_stage": failure_stage,
             "sandbox_feedback": sandbox_feedback,
             "surviving_mutants": surviving_mutants,
             "pit_metrics": pit_metrics
@@ -648,6 +666,9 @@ def mutation_node(state: AgentState) -> Dict:
                 and generated_mutants > 0
             )
         ),
+        "compile_error": compile_error,
+        "test_failure": test_failure,
+        "failure_stage": failure_stage,
         "sandbox_feedback": sandbox_feedback,
         "surviving_mutants": surviving_mutants
     }

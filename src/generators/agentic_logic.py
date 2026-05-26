@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -868,6 +869,594 @@ def maven_output(
     )
 
 
+def strip_ansi(text: str) -> str:
+    return re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        text
+    )
+
+
+def extract_maven_compile_error(stdout: str) -> str:
+    cleaned_stdout = strip_ansi(stdout)
+
+    error_lines = []
+
+    for line in cleaned_stdout.splitlines():
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        if "error:" in stripped:
+            error_lines.append(stripped)
+            continue
+
+        if re.search(
+            r"^\[ERROR\]\s+/.+\.java(?::|\[)",
+            stripped
+        ):
+            error_lines.append(stripped)
+
+    if not error_lines:
+        return ""
+
+    deduped = []
+
+    for line in error_lines:
+        if line not in deduped:
+            deduped.append(line)
+
+    return "\n".join(deduped)
+
+
+def truncate_lines(
+    text: str,
+    max_lines: int = 140,
+    max_chars: int = 12000
+) -> str:
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    truncated = "\n".join(lines[:max_lines])
+
+    if len(lines) > max_lines:
+        truncated += (
+            f"\n... truncated {len(lines) - max_lines} lines ..."
+        )
+
+    if len(truncated) > max_chars:
+        truncated = (
+            truncated[:max_chars]
+            + "\n... truncated output ..."
+        )
+
+    return truncated
+
+
+def normalize_failure_line(line: str) -> str:
+    stripped = line.strip()
+
+    stripped = re.sub(
+        r"^\[ERROR\]\s+",
+        "",
+        stripped
+    )
+
+    stripped = re.sub(
+        r"^\[\w+\]\s+",
+        "",
+        stripped
+    )
+
+    return stripped
+
+
+def is_assertion_failure_line(line: str) -> bool:
+    normalized = normalize_failure_line(
+        line
+    )
+
+    markers = (
+        "org.opentest4j.AssertionFailedError",
+        "junit.framework.AssertionFailedError",
+        "org.junit.ComparisonFailure",
+        "junit.framework.ComparisonFailure",
+        "java.lang.AssertionError",
+        "AssertionFailedError",
+        "ComparisonFailure",
+        "AssertionError",
+    )
+
+    if any(
+        marker in normalized
+        for marker in markers
+    ):
+        return True
+
+    lower = normalized.lower()
+
+    return (
+        "expected:" in lower
+        and "but was:" in lower
+    )
+
+
+def is_stack_trace_line(line: str) -> bool:
+    normalized = normalize_failure_line(
+        line
+    )
+
+    return (
+        normalized.startswith("at ")
+        or normalized.startswith("Caused by:")
+        or normalized.startswith("Suppressed:")
+        or bool(
+            re.match(
+                r"^[\w.$]+(?:Exception|Error):",
+                normalized
+            )
+        )
+    )
+
+
+def extract_assertion_stack_trace(
+    text: str,
+    max_lines: int = 80,
+    max_chars: int = 8000
+) -> str:
+    cleaned_text = strip_ansi(
+        text or ""
+    )
+
+    lines = cleaned_text.splitlines()
+
+    start_index = None
+
+    for index, line in enumerate(lines):
+        if is_assertion_failure_line(line):
+            start_index = index
+            break
+
+    if start_index is None:
+        return ""
+
+    selected = []
+
+    for line in lines[start_index:]:
+        normalized = normalize_failure_line(
+            line
+        )
+
+        if not normalized:
+            if selected:
+                break
+
+            continue
+
+        if (
+            selected
+            and not is_stack_trace_line(normalized)
+            and not is_assertion_failure_line(normalized)
+            and not normalized.startswith("...")
+        ):
+            break
+
+        selected.append(normalized)
+
+        if len(selected) >= max_lines:
+            selected.append(
+                "... truncated stack trace ..."
+            )
+            break
+
+    return truncate_lines(
+        "\n".join(selected),
+        max_lines=max_lines,
+        max_chars=max_chars
+    )
+
+
+def is_pit_green_suite_failure(stdout: str) -> bool:
+    return (
+        "did not pass without mutation" in stdout
+        or "Mutation testing requires a green suite" in stdout
+        or "Tests failing without mutation" in stdout
+    )
+
+
+def extract_pit_green_suite_failure(stdout: str) -> str:
+    cleaned_stdout = strip_ansi(stdout)
+    lines = cleaned_stdout.splitlines()
+    details = []
+    capture = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if (
+            "did not pass without mutation" in stripped
+            or "Mutation testing requires a green suite" in stripped
+            or "Tests failing without mutation" in stripped
+        ):
+            capture = True
+
+        if capture and stripped:
+            details.append(stripped)
+
+        if (
+            capture
+            and stripped.startswith("Description [")
+        ):
+            continue
+
+    if details:
+        return truncate_lines(
+            "\n".join(details),
+            max_lines=40,
+            max_chars=4000
+        )
+
+    return ""
+
+
+def target_method_name(state: AgentState) -> str:
+    item_id = str(
+        state.get(
+            "item_id",
+            ""
+        )
+    ).strip()
+
+    if item_id:
+        return item_id
+
+    dp = state.get("raw_datapoint") or {}
+    test_prefix = dp.get(
+        "testPrefix",
+        {}
+    )
+
+    return str(
+        test_prefix.get(
+            "identifier",
+            ""
+        )
+    ).strip()
+
+
+def surefire_test_selector(
+    target: SandboxTarget,
+    state: AgentState
+) -> str:
+    method_name = target_method_name(
+        state
+    )
+
+    if target.target_tests and method_name:
+        return (
+            f"{target.target_tests}"
+            f"#{method_name}"
+        )
+
+    return target.target_tests
+
+
+def surefire_command(
+    target: SandboxTarget,
+    state: AgentState
+) -> List[str]:
+    command = [
+        "mvn",
+        "test",
+        "-DfailIfNoTests=false",
+        "-DfailIfNoSpecifiedTests=false"
+    ]
+
+    selector = surefire_test_selector(
+        target,
+        state
+    )
+
+    if selector:
+        command.insert(
+            2,
+            f"-Dtest={selector}"
+        )
+
+    return command
+
+
+def collect_surefire_text_reports(
+    repo_path: Path,
+    target_tests: str
+) -> str:
+    reports_dir = (
+        repo_path
+        / "target"
+        / "surefire-reports"
+    )
+
+    if not reports_dir.exists():
+        return ""
+
+    candidates = []
+
+    if target_tests:
+        candidates.extend([
+            reports_dir / f"{target_tests}.txt",
+            reports_dir / f"TEST-{target_tests}.xml",
+        ])
+
+    candidates.extend(
+        sorted(
+            reports_dir.glob("*.txt"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True
+        )[:3]
+    )
+
+    chunks = []
+    seen = set()
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        resolved = path.resolve()
+
+        if resolved in seen:
+            continue
+
+        seen.add(resolved)
+
+        if path.suffix == ".xml":
+            continue
+
+        try:
+            text = path.read_text(
+                encoding="utf-8",
+                errors="replace"
+            )
+        except Exception:
+            continue
+
+        if text.strip():
+            assertion_trace = extract_assertion_stack_trace(
+                text
+            )
+
+            if assertion_trace:
+                text = (
+                    "ASSERTION STACK TRACE:\n"
+                    f"{assertion_trace}\n\n"
+                    "FULL REPORT EXCERPT:\n"
+                    f"{text}"
+                )
+
+            chunks.append(
+                f"--- {path.name} ---\n"
+                f"{truncate_lines(text)}"
+            )
+
+    return "\n\n".join(chunks)
+
+
+def collect_surefire_xml_failures(
+    repo_path: Path,
+    target_tests: str,
+    method_name: str
+) -> str:
+    reports_dir = (
+        repo_path
+        / "target"
+        / "surefire-reports"
+    )
+
+    if not reports_dir.exists():
+        return ""
+
+    candidates = []
+
+    if target_tests:
+        candidates.append(
+            reports_dir / f"TEST-{target_tests}.xml"
+        )
+
+    candidates.extend(
+        sorted(
+            reports_dir.glob("TEST-*.xml"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True
+        )[:3]
+    )
+
+    chunks = []
+    seen = set()
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        resolved = path.resolve()
+
+        if resolved in seen:
+            continue
+
+        seen.add(resolved)
+
+        try:
+            root = ET.parse(path).getroot()
+        except Exception:
+            continue
+
+        for testcase in root.iter("testcase"):
+            name = testcase.attrib.get(
+                "name",
+                ""
+            )
+
+            if method_name and name != method_name:
+                continue
+
+            for child in testcase:
+                if child.tag not in {
+                    "failure",
+                    "error"
+                }:
+                    continue
+
+                message = child.attrib.get(
+                    "message",
+                    ""
+                )
+
+                child_type = child.attrib.get(
+                    "type",
+                    child.tag
+                )
+
+                body = child.text or ""
+
+                exception_line = child_type
+
+                if message:
+                    exception_line = (
+                        f"{exception_line}: {message}"
+                    )
+
+                stack_trace = (
+                    extract_assertion_stack_trace(body)
+                    or truncate_lines(
+                        body,
+                        max_lines=80,
+                        max_chars=8000
+                    )
+                )
+
+                chunks.append(
+                    "\n".join([
+                        f"--- {path.name} :: {name} ---",
+                        f"{child.tag.upper()}: {child_type}",
+                        f"MESSAGE: {message}",
+                        f"EXCEPTION: {exception_line}",
+                        "STACKTRACE:",
+                        stack_trace
+                    ]).strip()
+                )
+
+    return "\n\n".join(chunks)
+
+
+def extract_maven_test_failure_lines(stdout: str) -> str:
+    cleaned_stdout = strip_ansi(stdout)
+    lines = cleaned_stdout.splitlines()
+    selected = []
+    capture_until = -1
+
+    interesting_patterns = (
+        "<<< FAILURE!",
+        "<<< ERROR!",
+        "[ERROR] Failures:",
+        "[ERROR] Errors:",
+        "[ERROR] Tests run:",
+        "There are test failures",
+        "Please refer to",
+    )
+
+    for index, line in enumerate(lines):
+        if any(
+            pattern in line
+            for pattern in interesting_patterns
+        ):
+            capture_until = max(
+                capture_until,
+                index + 25
+            )
+
+        if index <= capture_until:
+            selected.append(line)
+
+    if not selected:
+        return ""
+
+    return truncate_lines(
+        "\n".join(selected),
+        max_lines=100,
+        max_chars=9000
+    )
+
+
+def collect_green_suite_failure_details(
+    repo_path: Path,
+    target: SandboxTarget,
+    state: AgentState,
+    stdout: str
+) -> str:
+    method_name = target_method_name(
+        state
+    )
+
+    xml_details = collect_surefire_xml_failures(
+        repo_path,
+        target.target_tests,
+        method_name
+    )
+
+    text_details = collect_surefire_text_reports(
+        repo_path,
+        target.target_tests
+    )
+
+    output_details = extract_maven_test_failure_lines(
+        stdout
+    )
+
+    assertion_trace = extract_assertion_stack_trace(
+        "\n\n".join([
+            xml_details,
+            text_details,
+            output_details,
+            stdout
+        ])
+    )
+
+    sections = []
+
+    if assertion_trace:
+        sections.append(
+            "ASSERTION STACK TRACE:\n"
+            f"{assertion_trace}"
+        )
+
+    if xml_details:
+        sections.append(
+            "SUREFIRE XML FAILURE:\n"
+            f"{xml_details}"
+        )
+
+    if text_details:
+        sections.append(
+            "SUREFIRE TEXT REPORT:\n"
+            f"{text_details}"
+        )
+
+    if output_details:
+        sections.append(
+            "MAVEN TEST OUTPUT:\n"
+            f"{output_details}"
+        )
+
+    if not sections:
+        sections.append(
+            "MAVEN TEST OUTPUT:\n"
+            f"{truncate_lines(stdout)}"
+        )
+
+    return "\n\n".join(sections)
+
+
 def is_build_failure(
     result: subprocess.CompletedProcess,
     stdout: str
@@ -1008,6 +1597,9 @@ def sandbox_result(
     compile_time: float,
     is_compiled: bool,
     sandbox_feedback: str = "",
+    compile_error: str = "",
+    test_failure: str = "",
+    failure_stage: str = "",
     surviving_mutants: str = "",
     stdout: str = "",
     target: Optional[SandboxTarget] = None,
@@ -1032,6 +1624,9 @@ def sandbox_result(
         "pit_metrics": metrics.as_dict(),
         "compile_time": compile_time,
         "is_compiled": is_compiled,
+        "compile_error": compile_error,
+        "test_failure": test_failure,
+        "failure_stage": failure_stage,
         "sandbox_feedback": sandbox_feedback,
         "surviving_mutants": surviving_mutants,
         "stdout": stdout,
@@ -1107,6 +1702,10 @@ def execute_sandbox(state: AgentState) -> Dict:
             compile_result,
             compile_stdout
         ):
+            compile_error = extract_maven_compile_error(
+                compile_stdout
+            )
+
             # print(
             #     "\n========= COMPILATION / BUILD FAILURE =========\n"
             # )
@@ -1122,6 +1721,8 @@ def execute_sandbox(state: AgentState) -> Dict:
                 compile_time=compile_time,
                 is_compiled=False,
                 sandbox_feedback=compile_stdout,
+                compile_error=compile_error,
+                failure_stage="compile",
                 stdout=compile_stdout,
                 target=target,
             )
@@ -1147,6 +1748,57 @@ def execute_sandbox(state: AgentState) -> Dict:
             mutate_result,
             stdout
         ):
+            if is_pit_green_suite_failure(
+                stdout
+            ):
+                green_result = run_maven(
+                    target.repo_path,
+                    surefire_command(target, state),
+                    env
+                )
+
+                green_stdout = maven_output(
+                    green_result
+                )
+
+                pit_failure = extract_pit_green_suite_failure(
+                    stdout
+                )
+
+                test_failure = collect_green_suite_failure_details(
+                    target.repo_path,
+                    target,
+                    state,
+                    green_stdout
+                )
+
+                feedback = (
+                    "PIT GREEN SUITE FAILURE\n\n"
+                    "PIT BASELINE CONTEXT:\n"
+                    f"{pit_failure}\n\n"
+                    "TARGET TEST FAILURE DETAILS:\n"
+                    f"{test_failure}"
+                )
+
+                return sandbox_result(
+                    metrics=metrics,
+                    compile_time=compile_time,
+                    is_compiled=False,
+                    sandbox_feedback=feedback,
+                    test_failure=test_failure,
+                    failure_stage="green_suite",
+                    stdout=(
+                        stdout
+                        + "\n\n"
+                        + green_stdout
+                    ),
+                    target=target,
+                )
+
+            compile_error = extract_maven_compile_error(
+                stdout
+            )
+
             # print(
             #     "\n========= PIT / BUILD FAILURE =========\n"
             # )
@@ -1162,6 +1814,8 @@ def execute_sandbox(state: AgentState) -> Dict:
                 compile_time=compile_time,
                 is_compiled=False,
                 sandbox_feedback=stdout,
+                compile_error=compile_error,
+                failure_stage="pit",
                 stdout=stdout,
                 target=target,
             )
@@ -1191,6 +1845,10 @@ def execute_sandbox(state: AgentState) -> Dict:
                 compile_time=compile_time,
                 is_compiled=False,
                 sandbox_feedback=feedback,
+                compile_error=extract_maven_compile_error(
+                    feedback
+                ),
+                failure_stage="pit_missing_csv",
                 stdout=stdout,
                 target=target,
             )
@@ -1249,6 +1907,8 @@ def execute_sandbox(state: AgentState) -> Dict:
             compile_time=compile_time,
             is_compiled=False,
             sandbox_feedback=traceback.format_exc(),
+            compile_error=traceback.format_exc(),
+            failure_stage="exception",
             surviving_mutants="",
             stdout=stdout,
             target=target,
@@ -1488,6 +2148,9 @@ OUTPUT REQUIREMENTS:
 3. NEVER output passive method calls without assertions.
 4. EVERY generated line must compile inside the target test body.
 5. EVERY line must end with ';'
+6. EVERY assertion must pass on the original unmutated implementation.
+7. If feedback reports BASELINE TEST FAILURE, prioritize green-suite
+   correctness over mutation score.
 
 ALLOWED ASSERTION APIS:
 - assertEquals(...)
@@ -1558,6 +2221,12 @@ ASSERTION QUALITY RULES:
 5. Avoid duplicate assertions.
 6. Avoid redundant assertions.
 7. Avoid weak assertions that always pass.
+8. Avoid object-wide toString() or broad string contains assertions
+   unless the focal behavior is explicitly a toString contract and the
+   exact expected string is visible in the context.
+9. Prefer dedicated getters, fields, collections, maps, or returned values
+   over indirect debug/string representations.
+10. Never infer expected values only from the test method name.
 
 MUTATION-GUIDED RULES:
 1. Focus assertions on surviving mutant behavior.
@@ -1624,12 +2293,18 @@ def critic_node(state: AgentState) -> Dict:
             "is_compiled": False,
             "mutation_score": None,
             "test_strength": None,
+            "compile_error": injection_result.get(
+                "sandbox_feedback",
+                "Failed to inject prediction."
+            ),
             "sandbox_feedback": injection_result.get(
                 "sandbox_feedback",
                 "Failed to inject prediction."
             ),
             "surviving_mutants": "",
             "pit_metrics": {},
+            "failure_stage": "injection",
+            "test_failure": "",
         }
     else:
         result = execute_sandbox(state)
@@ -1639,15 +2314,62 @@ def critic_node(state: AgentState) -> Dict:
 
     if not result.get("is_compiled", True):
 
-        compile_error = result.get(
-            "sandbox_feedback",
-            "Unknown compilation error."
+        failure_stage = result.get(
+            "failure_stage",
+            "compile"
         )
 
-        feedback = (
-            "COMPILATION FAILURE\n\n"
-            f"{compile_error}"
-        )
+        if failure_stage == "green_suite":
+            test_failure = result.get(
+                "test_failure",
+                ""
+            )
+
+            if not test_failure:
+                test_failure = result.get(
+                    "sandbox_feedback",
+                    "Generated test failed before mutation analysis."
+                )
+
+            feedback = (
+                "BASELINE TEST FAILURE\n\n"
+                "The assertion block compiled, but failed on the "
+                "original unmutated code. The next revision must "
+                "remove or fix the failing assertion before trying "
+                "to kill more mutants.\n\n"
+                "RAW TEST FAILURE:\n"
+                f"{test_failure}"
+            )
+
+        elif failure_stage == "pit":
+            pit_feedback = result.get(
+                "sandbox_feedback",
+                "Unknown PIT failure."
+            )
+
+            feedback = (
+                "PIT EXECUTION FAILURE\n\n"
+                "RAW PIT FAILURE:\n"
+                f"{truncate_lines(pit_feedback)}"
+            )
+
+        else:
+            compile_error = result.get(
+                "compile_error",
+                ""
+            )
+
+            if not compile_error:
+                compile_error = result.get(
+                    "sandbox_feedback",
+                    "Unknown compilation error."
+                )
+
+            feedback = (
+                "COMPILATION FAILURE\n\n"
+                "RAW COMPILE ERROR:\n"
+                f"{truncate_lines(compile_error)}"
+            )
 
     else:
 
@@ -1674,8 +2396,6 @@ def critic_node(state: AgentState) -> Dict:
             "No surviving mutant details."
         )
 
-        print("\n         [SURVIVING MUTANTS RAW]\n")
-        print(mutant_details)
 
         feedback = (
             f"TEST STRENGTH: {test_strength:.4f}\n"
@@ -1756,7 +2476,7 @@ MISSING_VALIDATIONS:
 INVALID_SCOPE_USAGE:
 - ...
 
-NEXT_ASSERTION_GOALS:
+NEXT_ASSERTION_GOALS: (keep in mind that we can only write assertions, not write any new tests or modify any other code)
 - ...
 
 RULES:
@@ -1767,6 +2487,11 @@ RULES:
 5. Focus on scope errors.
 6. Focus on compile failures.
 7. Focus on surviving mutant causes.
+8. If feedback says BASELINE TEST FAILURE:
+   - treat the previous assertions as invalid on the original code
+   - identify the exact failing assertion or exception from RAW TEST FAILURE
+   - recommend removing or correcting failing lines before adding strength
+   - do not discuss surviving mutants until the baseline test is green
 """
 
     context = (
@@ -1839,6 +2564,9 @@ def route_critic(state: AgentState):
     )
 
     if best_score >= 1.0:
+        return END
+
+    if not state.get("use_evaluator_loop", False):
         return END
 
     if plateau_count >= 1:

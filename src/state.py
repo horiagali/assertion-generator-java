@@ -55,6 +55,12 @@ class AgentState(TypedDict, total=False):
 
     compile_time: float
 
+    compile_error: str
+
+    test_failure: str
+
+    failure_stage: str
+
     is_evaluable: bool
 
     # =========================================================

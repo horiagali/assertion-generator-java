@@ -140,6 +140,75 @@ def save_broken_tests(
         )
 
 
+def build_ablation_variants():
+    component_matrix = [
+        (
+            "None",
+            False,
+            False,
+            False
+        ),
+        (
+            "Summarizer",
+            True,
+            False,
+            False
+        ),
+        (
+            "Planner",
+            False,
+            True,
+            False
+        ),
+        (
+            "Refining Loop",
+            False,
+            False,
+            True
+        ),
+        (
+            "Summarizer + Planner",
+            True,
+            True,
+            False
+        ),
+        (
+            "Summarizer + Loop",
+            True,
+            False,
+            True
+        ),
+        (
+            "Planner + Loop",
+            False,
+            True,
+            True
+        ),
+        (
+            "Full Agent",
+            True,
+            True,
+            True
+        ),
+    ]
+
+    return [
+        {
+            "name": name,
+            "run_mode": "agentic",
+            "sum": use_summarizer,
+            "plan": use_planner,
+            "loop": use_loop
+        }
+        for (
+            name,
+            use_summarizer,
+            use_planner,
+            use_loop
+        ) in component_matrix
+    ]
+
+
 def evaluate_datapoint(
     state,
     item_id,
@@ -601,8 +670,15 @@ def run_evaluation(config, json_files, limit=None):
             broken_tests
         )
 
-    final_avg = (
+    final_avg_ts = (
         total_test_strength
+        / completed_runs
+        if completed_runs > 0
+        else 0.0
+    )
+
+    final_avg_ms = (
+        total_mutation_score
         / completed_runs
         if completed_runs > 0
         else 0.0
@@ -665,7 +741,12 @@ def run_evaluation(config, json_files, limit=None):
 
     print(
         f"Average Test Strength: "
-        f"{final_avg:.4f}"
+        f"{final_avg_ts:.4f}"
+    )
+
+    print(
+        f"Average Mutation Score: "
+        f"{final_avg_ms:.4f}"
     )
 
     print(
@@ -674,7 +755,8 @@ def run_evaluation(config, json_files, limit=None):
     )
 
     return (
-        final_avg,
+        final_avg_ts,
+        final_avg_ms,
         avg_time,
         completed_runs
     )
@@ -728,29 +810,7 @@ def main():
 
     if args.mode == "ablation":
 
-        variants = [
-            {
-                "name": "V2 (Loop Only)",
-                "run_mode": "agentic",
-                "sum": False,
-                "plan": False,
-                "loop": True
-            },
-            {
-                "name": "V3 (Thought Only)",
-                "run_mode": "agentic",
-                "sum": True,
-                "plan": True,
-                "loop": False
-            },
-            {
-                "name": "V4 (Full Agent)",
-                "run_mode": "agentic",
-                "sum": True,
-                "plan": True,
-                "loop": True
-            },
-        ]
+        variants = build_ablation_variants()
 
         results = {}
 
@@ -759,19 +819,26 @@ def main():
             print(
                 f"\n>>> RUNNING ABLATION: "
                 f"{v['name']}"
+                f" | summarizer={v['sum']}"
+                f" planner={v['plan']}"
+                f" loop={v['loop']}"
             )
 
-            avg_s, avg_t, completed = run_evaluation(
+            avg_s, avg_m, avg_t, completed = run_evaluation(
                 v,
                 json_files,
                 args.limit
             )
 
-            results[v["name"]] = (
-                avg_s,
-                avg_t,
-                completed
-            )
+            results[v["name"]] = {
+                "avg_test_strength": avg_s,
+                "avg_mutation_score": avg_m,
+                "avg_time": avg_t,
+                "completed": completed,
+                "summarizer": v["sum"],
+                "planner": v["plan"],
+                "loop": v["loop"],
+            }
 
         print(
             "\n"
@@ -784,13 +851,18 @@ def main():
         for name, metrics in results.items():
 
             print(
-                f"{name:<20} "
+                f"{name:<22} "
+                f"| S={int(metrics['summarizer'])} "
+                f"P={int(metrics['planner'])} "
+                f"L={int(metrics['loop'])} "
                 f"| Avg Test Strength: "
-                f"{metrics[0]:.4f} "
+                f"{metrics['avg_test_strength']:.4f} "
+                f"| Avg Mutation Score: "
+                f"{metrics['avg_mutation_score']:.4f} "
                 f"| Valid Runs: "
-                f"{metrics[2]} "
+                f"{metrics['completed']} "
                 f"| Avg Time: "
-                f"{metrics[1]:.2f}s"
+                f"{metrics['avg_time']:.2f}s"
             )
 
     else:
@@ -807,7 +879,7 @@ def main():
             f"| MODE: {args.mode.upper()}"
         )
 
-        avg_s, avg_t, completed = run_evaluation(
+        avg_s, avg_m, avg_t, completed = run_evaluation(
             config,
             json_files,
             args.limit
@@ -817,6 +889,8 @@ def main():
             f"\nDONE. "
             f"Final Avg Test Strength: "
             f"{avg_s:.4f} "
+            f"| Final Avg Mutation Score: "
+            f"{avg_m:.4f} "
             f"| Valid Runs: {completed} "
             f"| Avg Time: {avg_t:.2f}s"
         )
