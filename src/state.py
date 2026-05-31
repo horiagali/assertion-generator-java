@@ -94,3 +94,11 @@ class AgentState(TypedDict, total=False):
     plateau_count: int
 
     best_score: float
+
+    best_mutation_score: float
+
+    best_covered_mutants: int
+
+    best_rank: list
+
+    best_prediction: str

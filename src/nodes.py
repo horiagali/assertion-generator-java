@@ -159,6 +159,11 @@ def data_loader_node(state: AgentState) -> Dict:
         {}
     )
 
+    test_class = dp.get(
+        "_testClass",
+        {}
+    )
+
     broken_tests = load_broken_tests()
 
     is_broken = False
@@ -214,6 +219,36 @@ def data_loader_node(state: AgentState) -> Dict:
             "body": test_body,
 
             "invokedMethods": invoked_methods
+        },
+
+        "testClass": {
+
+            "identifier": test_class.get(
+                "identifier"
+            ),
+
+            "packageIdentifier": test_class.get(
+                "packageIdentifier"
+            ),
+
+            "filePath": test_class.get(
+                "filePath"
+            ),
+
+            "fields": test_class.get(
+                "fields",
+                []
+            ),
+
+            "setupTearDownMethods": test_class.get(
+                "setupTearDownMethods",
+                []
+            ),
+
+            "auxiliaryMethods": test_class.get(
+                "auxiliaryMethods",
+                []
+            )
         },
 
         "_focalClass": {
@@ -348,9 +383,99 @@ def data_loader_node(state: AgentState) -> Dict:
                     f"- {signature}"
                 )
 
+    test_field_lines = []
+
+    for field in test_class.get(
+        "fields",
+        []
+    ):
+
+        if isinstance(field, str):
+
+            test_field_lines.append(
+                f"- {field}"
+            )
+
+        elif isinstance(field, dict):
+
+            signature = field.get(
+                "signature",
+                ""
+            )
+
+            if signature:
+
+                test_field_lines.append(
+                    f"- {signature}"
+                )
+
+    setup_lines = []
+
+    for method in test_class.get(
+        "setupTearDownMethods",
+        []
+    ):
+
+        if isinstance(method, dict):
+
+            signature = method.get(
+                "signature",
+                ""
+            )
+
+            body = method.get(
+                "body",
+                ""
+            )
+
+            if signature or body:
+
+                setup_lines.append(
+                    f"- {signature}\n{body}".strip()
+                )
+
+    helper_lines = []
+
+    for method in test_class.get(
+        "auxiliaryMethods",
+        []
+    ):
+
+        if isinstance(method, dict):
+
+            signature = method.get(
+                "signature",
+                ""
+            )
+
+            return_type = method.get(
+                "returnType",
+                ""
+            )
+
+            if signature:
+
+                helper_lines.append(
+                    f"- {signature}"
+                    + (
+                        f" -> {return_type}"
+                        if return_type
+                        else ""
+                    )
+                )
+
     compact_prompt_context = f"""
 TARGET TEST METHOD:
 {test_body}
+
+TEST CLASS FIELDS:
+{chr(10).join(test_field_lines)}
+
+SETUP / TEARDOWN METHODS:
+{chr(10).join(setup_lines)}
+
+TEST CLASS HELPER METHODS:
+{chr(10).join(helper_lines)}
 
 VISIBLE FOCAL METHODS:
 {chr(10).join(focal_method_signatures)}
@@ -431,6 +556,8 @@ VISIBLE FIELDS:
         "full_prompt_context": full_prompt_context,
 
         "compact_prompt_context": compact_prompt_context,
+
+        "prompt_context": full_prompt_context,
 
         "ground_truth": dp.get(
             "target"

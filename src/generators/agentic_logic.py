@@ -32,7 +32,7 @@ from config import (
 llm = ChatOpenAI(
     base_url="http://172.18.96.1:11434/v1",
     api_key="ollama",
-    model="gpt-oss:120b-cloud",
+    model="qwen3-coder:480b-cloud",
     temperature=0
 )
 
@@ -345,6 +345,113 @@ def compute_pit_metrics(
     )
 
 
+def repo_path_from_pit_csv(
+    csv_path: Optional[Path]
+) -> Optional[Path]:
+    if not csv_path:
+        return None
+
+    for parent in csv_path.resolve().parents:
+        if parent.name == "target":
+            return parent.parent
+
+    return None
+
+
+def find_mutated_source_file(
+    repo_path: Optional[Path],
+    mutant: PitMutation
+) -> Optional[Path]:
+    if not repo_path:
+        return None
+
+    candidates = []
+
+    if mutant.mutated_class:
+        relative_class_path = (
+            mutant.mutated_class.replace(
+                ".",
+                "/"
+            )
+            + ".java"
+        )
+
+        candidates.extend([
+            repo_path / "src" / "main" / "java" / relative_class_path,
+            repo_path / "src" / "test" / "java" / relative_class_path,
+        ])
+
+    if mutant.source_file:
+        for source_root in (
+            repo_path / "src" / "main" / "java",
+            repo_path / "src" / "test" / "java",
+        ):
+            if source_root.exists():
+                candidates.extend(
+                    source_root.rglob(
+                        mutant.source_file
+                    )
+                )
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    return None
+
+
+def source_snippet(
+    path: Optional[Path],
+    line: Optional[int],
+    radius: int = 3
+) -> str:
+    if (
+        not path
+        or not line
+        or not path.exists()
+    ):
+        return ""
+
+    try:
+        lines = path.read_text(
+            encoding="utf-8",
+            errors="replace"
+        ).splitlines()
+    except Exception:
+        return ""
+
+    start = max(
+        line - radius,
+        1
+    )
+
+    end = min(
+        line + radius,
+        len(lines)
+    )
+
+    snippet_lines = []
+
+    for number in range(
+        start,
+        end + 1
+    ):
+        marker = (
+            ">>"
+            if number == line
+            else "  "
+        )
+
+        snippet_lines.append(
+            f"{marker} {number}: "
+            f"{lines[number - 1]}"
+        )
+
+    return "\n".join(
+        snippet_lines
+    )
+
+
 def extract_pit_mutant_details(
     stdout: str,
     csv_path: Path = None,
@@ -385,6 +492,10 @@ def extract_pit_mutant_details(
 
             return "No surviving mutants detected."
 
+        repo_path = repo_path_from_pit_csv(
+            csv_path
+        )
+
         grouped = defaultdict(list)
 
         for mutant in survived:
@@ -394,7 +505,7 @@ def extract_pit_mutant_details(
             )
 
             grouped[key].append(
-                mutant.line
+                mutant
             )
 
         feedback = [
@@ -409,24 +520,32 @@ def extract_pit_mutant_details(
 
         for (
             (method, mutator),
-            lines
+            mutants
         ) in sorted_groups[:limit]:
             unique_lines = sorted({
-                line
-                for line in lines
-                if line is not None
+                mutant.line
+                for mutant in mutants
+                if mutant.line is not None
             })
+
+            representative = mutants[0]
 
             feedback.append(
                 f"- Method: {method}"
             )
+
+            if representative.mutated_class:
+                feedback.append(
+                    "  Mutated class: "
+                    f"{representative.mutated_class}"
+                )
 
             feedback.append(
                 f"  Mutator: {mutator}"
             )
 
             feedback.append(
-                f"  Survived mutants: {len(lines)}"
+                f"  Survived mutants: {len(mutants)}"
             )
 
             feedback.append(
@@ -468,6 +587,32 @@ def extract_pit_mutant_details(
                 feedback.append(
                     f"  Insight: {semantic_hint}"
                 )
+
+            snippet_path = find_mutated_source_file(
+                repo_path,
+                representative
+            )
+
+            snippet_line = (
+                unique_lines[0]
+                if unique_lines
+                else representative.line
+            )
+
+            snippet = source_snippet(
+                snippet_path,
+                snippet_line
+            )
+
+            if snippet:
+                feedback.append(
+                    "  Source context:"
+                )
+
+                for snippet_text in snippet.splitlines():
+                    feedback.append(
+                        f"    {snippet_text}"
+                    )
 
             feedback.append("")
 
@@ -933,6 +1078,18 @@ def truncate_lines(
         )
 
     return truncated
+
+
+def print_agent_output(
+    label: str,
+    text: str,
+    max_lines: int = 260,
+    max_chars: int = 20000
+) -> None:
+    print(
+        f"\n         [{label} OUTPUT]\n"
+        f"{truncate_lines(str(text), max_lines=max_lines, max_chars=max_chars)}\n"
+    )
 
 
 def normalize_failure_line(line: str) -> str:
@@ -1990,19 +2147,6 @@ MUTATION_HOTSPOTS:
 CONSTRAINTS:
 - ...
 
-Infer likely Builder/fluent state-construction APIs
-when constructor propagation patterns strongly imply them.
-
-Example inference pattern:
-- this.language = b.language;
-- private String language;
-
-→ likely Builder API:
-- Builder.language(String)
-
-Inferred APIs should ONLY be emitted when strongly
-supported by visible field names and constructor propagation.
-
 RULES:
 1. ONLY summarize behavior explicitly derivable from the context.
 2. NEVER invent APIs.
@@ -2016,6 +2160,8 @@ RULES:
 10. NO prose paragraphs.
 11. NO markdown.
 12. NO explanations outside bullet lists.
+13. Do NOT infer builder/fluent APIs unless their signatures are present
+    in the provided context.
 
 
 
@@ -2033,7 +2179,10 @@ RULES:
 
     summary = response.content.strip()
 
-    # print(f"         [MANIFEST]\n{summary}\n")
+    print_agent_output(
+        "SUMMARIZER",
+        summary
+    )
 
     return {
         "summary": summary
@@ -2043,6 +2192,9 @@ RULES:
 def downstream_context_block(state: AgentState) -> str:
     if state.get("use_summarizer"):
         return (
+            "FULL RAW CONTEXT:\n"
+            f"{state['full_prompt_context']}\n\n"
+
             f"CRUCIAL CONTEXT:\n"
             f"{state['compact_prompt_context']}\n\n"
 
@@ -2071,17 +2223,26 @@ Design assertion objectives that maximize PIT mutation score.
 
 OUTPUT FORMAT MUST BE EXACTLY:
 
+SAFE_EXISTING_VARIABLES:
+- variable : type/origin : safe uses
+
+SAFE_METHOD_CALLS:
+- receiver.method(args) -> assertion-relevant return/effect
+
 PRIMARY_TARGETS:
 - ...
 
-HIGH_VALUE_ASSERTIONS:
-- ...
+ASSERTION_CANDIDATES:
+- assertion goal : exact variables/methods to use : expected value source
 
 MUTATION_RISKS:
 - ...
 
 INVALID_ASSERTION_RISKS:
 - ...
+
+DO_NOT_USE:
+- unavailable/speculative variable or API : reason
 
 ASSERTION_PRIORITIES:
 1. ...
@@ -2094,9 +2255,11 @@ RULES:
 3. NO prose paragraphs.
 4. Use compact bullet points only.
 5. Focus on semantic verification.
-6. Use ONLY visible variables and methods.
+6. Use ONLY variables and methods visible in the supplied context.
 7. Flag invalid scope assumptions.
 8. Prefer exact semantic checks over null checks.
+9. Every assertion candidate must name the concrete existing receiver or
+   constructor that the coder should use.
 """
 
     context = downstream_context_block(
@@ -2110,7 +2273,10 @@ RULES:
 
     plan = response.content.strip()
 
-    # print(f"         [PLAN]\n{plan}\n")
+    print_agent_output(
+        "PLANNER",
+        plan
+    )
 
     return {
         "plan": plan
@@ -2129,6 +2295,27 @@ def coder_node(state: AgentState) -> Dict:
 
     previous_code = state.get("prediction", "")
 
+    latest_feedback = state.get(
+        "latest_feedback",
+        ""
+    )
+
+    best_prediction = state.get(
+        "best_prediction",
+        ""
+    )
+
+    best_rank = state.get(
+        "best_rank",
+        []
+    )
+
+    has_best_green = (
+        bool(best_prediction)
+        and len(best_rank) > 1
+        and int(best_rank[1]) == 1
+    )
+
     prompt = (
         f"{downstream_context_block(state)}\n\n"
 
@@ -2136,18 +2323,38 @@ def coder_node(state: AgentState) -> Dict:
         f"{strategy}\n\n"
     )
 
+    if has_best_green:
+
+        prompt += (
+            "BEST GREEN ASSERTIONS SO FAR:\n"
+            f"{best_prediction}\n\n"
+            "Use this as the safe fallback. Preserve its correct "
+            "semantics unless the latest feedback clearly shows how "
+            "to improve it without breaking the green suite.\n\n"
+        )
+
     if previous_code:
 
         prompt += (
-            f"PREVIOUS CODE (FOR REFERENCE/FIXING):\n"
+            f"LAST ATTEMPT:\n"
             f"{previous_code}\n\n"
+            "This is the most recent attempted assertion block. "
+            "It may be worse than the best green block above, and it "
+            "may have caused the latest failure.\n\n"
+        )
+
+    if latest_feedback:
+
+        prompt += (
+            "LAST FAILURE / SANDBOX FEEDBACK:\n"
+            f"{latest_feedback}\n\n"
         )
 
     prompt += """ 
 TASK:
 Generate ONLY valid Java test-body code.
 Write the COMPLETE, fully corrected assertion block.
-If previous code caused a compilation or runtime failure,
+If the last attempt caused a compilation or runtime failure,
 REMOVE or FIX the failing lines.
 The output replaces the entire previous assertion block.
 
@@ -2199,11 +2406,15 @@ FORBIDDEN CODE:
 
 SCOPE RULES:
 1. Use ONLY identifiers explicitly visible in:
-   - TEST_SCOPE_VARIABLES
-   - visible constructors
-   - visible methods
+   - TARGET TEST METHOD
+   - TEST CLASS FIELDS
+   - SETUP / TEARDOWN METHODS
+   - TEST CLASS HELPER METHODS
+   - visible focal constructors
+   - visible focal methods
    - visible constants
    - visible fields
+   - ASSERTION MANIFEST, if present
 
 2. NEVER invent:
    - mocks
@@ -2216,7 +2427,8 @@ SCOPE RULES:
 
 3. NEVER call instance methods without a receiver object.
 
-4. If TEST_SCOPE_VARIABLES is empty:
+4. If no reusable variables are visible in the target test method or
+   test class fields:
    - instantiate objects inline using ONLY visible constructors
    - prefer inline constructor expressions over temporary variables
 
@@ -2282,9 +2494,63 @@ If uncertain, output fewer but stronger assertions.
         response.content
     )
 
+    print_agent_output(
+        "CODER ASSERTIONS",
+        new_prediction
+    )
+
     return {
         "prediction": new_prediction
     }
+
+
+def candidate_rank(
+    result: Dict,
+    test_strength: float,
+    mutation_score: float
+) -> tuple:
+    pit_metrics = result.get(
+        "pit_metrics",
+        {}
+    ) or {}
+
+    covered_mutants = result.get(
+        "covered_mutants",
+        pit_metrics.get(
+            "covered",
+            0
+        )
+    )
+
+    generated_mutants = pit_metrics.get(
+        "generated",
+        0
+    )
+
+    is_green = bool(
+        result.get(
+            "is_compiled",
+            False
+        )
+    )
+
+    is_evaluable = (
+        is_green
+        and covered_mutants is not None
+        and not (
+            covered_mutants == 0
+            and generated_mutants > 0
+        )
+    )
+
+    return (
+        int(is_evaluable),
+        int(is_green),
+        float(test_strength or 0.0),
+        float(mutation_score or 0.0),
+        int(covered_mutants or 0),
+    )
+
 
 def critic_node(state: AgentState) -> Dict:
 
@@ -2413,13 +2679,41 @@ def critic_node(state: AgentState) -> Dict:
             f"{mutant_details}"
         )
 
-    print(f"         [CRITIC]\n{feedback}\n")
+    diagnostic = (
+        f"failure_stage={result.get('failure_stage', '')}\n"
+        f"is_compiled={result.get('is_compiled', False)}\n"
+        f"test_strength={test_strength:.4f}\n"
+        f"mutation_score={mutation_score:.4f}\n\n"
+        f"{feedback}"
+    )
+
+    print_agent_output(
+        "CRITIC",
+        diagnostic
+    )
+
+    failure_signature = (
+        result.get(
+            "test_failure",
+            ""
+        )
+        or result.get(
+            "compile_error",
+            ""
+        )
+        or result.get(
+            "sandbox_feedback",
+            ""
+        )
+    )
 
     feedback_signature = (
         f"{result.get('is_compiled', False)}|"
+        f"{result.get('failure_stage', '')}|"
         f"{test_strength:.6f}|"
         f"{mutation_score:.6f}|"
-        f"{result.get('surviving_mutants', '')}"
+        f"{result.get('surviving_mutants', '')}|"
+        f"{truncate_lines(failure_signature, max_lines=25, max_chars=3000)}"
     )
 
     previous_signature = state.get(
@@ -2433,20 +2727,76 @@ def critic_node(state: AgentState) -> Dict:
         else 0
     )
 
+    current_rank = candidate_rank(
+        result,
+        test_strength,
+        mutation_score
+    )
+
+    best_rank = tuple(
+        state.get(
+            "best_rank",
+            (-1, -1, -1.0, -1.0, -1)
+        )
+    )
+
     best_score = state.get("best_score", 0.0)
+
+    best_mutation_score = state.get(
+        "best_mutation_score",
+        0.0
+    )
+
+    best_covered_mutants = state.get(
+        "best_covered_mutants",
+        0
+    )
 
     best_prediction = state.get(
         "best_prediction",
         ""
     )
 
-    if test_strength > best_score:
+    if (
+        state.get("prediction")
+        and current_rank > best_rank
+    ):
 
+        best_rank = current_rank
         best_score = test_strength
+        best_mutation_score = mutation_score
+        best_covered_mutants = (
+            result.get(
+                "covered_mutants",
+                (
+                    result.get(
+                        "pit_metrics",
+                        {}
+                    ) or {}
+                ).get(
+                    "covered",
+                    0
+                )
+            )
+            or 0
+        )
 
         best_prediction = state.get(
             "prediction",
             ""
+        )
+
+        print_agent_output(
+            "BEST CANDIDATE UPDATE",
+            (
+                f"rank={best_rank}\n"
+                f"test_strength={best_score:.4f}\n"
+                f"mutation_score={best_mutation_score:.4f}\n"
+                f"covered_mutants={best_covered_mutants}\n"
+                f"prediction:\n{best_prediction}"
+            ),
+            max_lines=80,
+            max_chars=8000
         )
 
     return {
@@ -2454,7 +2804,10 @@ def critic_node(state: AgentState) -> Dict:
         "latest_feedback": feedback,
         "latest_feedback_signature": feedback_signature,
         "plateau_count": plateau_count,
+        "best_rank": list(best_rank),
         "best_score": best_score,
+        "best_mutation_score": best_mutation_score,
+        "best_covered_mutants": best_covered_mutants,
         "best_prediction": best_prediction,
         "mutation_score": mutation_score,
         "test_strength": test_strength,
@@ -2485,6 +2838,9 @@ MISSING_VALIDATIONS:
 INVALID_SCOPE_USAGE:
 - ...
 
+EXACT_LINES_TO_REMOVE_OR_FIX:
+- previous assertion/local statement : reason
+
 NEXT_ASSERTION_GOALS: (keep in mind that we can only write assertions, not write any new tests or modify any other code)
 - ...
 
@@ -2501,6 +2857,8 @@ RULES:
    - identify the exact failing assertion or exception from RAW TEST FAILURE
    - recommend removing or correcting failing lines before adding strength
    - do not discuss surviving mutants until the baseline test is green
+9. Name concrete variables/method calls from the context whenever proposing
+   a next assertion goal.
 """
 
     context = (
@@ -2520,9 +2878,9 @@ RULES:
 
     improvement_plan = response.content.strip()
 
-    print(
-        f"         [REFINEMENT PLAN]\n"
-        f"{improvement_plan}\n"
+    print_agent_output(
+        "IMPROVER",
+        improvement_plan
     )
 
     return {
@@ -2662,6 +3020,9 @@ def run_agentic_logic(state: AgentState) -> Dict:
     )
 
     state["best_score"] = 0.0
+    state["best_mutation_score"] = 0.0
+    state["best_covered_mutants"] = 0
+    state["best_rank"] = [-1, -1, -1.0, -1.0, -1]
     state["best_prediction"] = ""
     state["iteration"] = 0
     state["plateau_count"] = 0
@@ -2675,11 +3036,24 @@ def run_agentic_logic(state: AgentState) -> Dict:
         or final_state.get("prediction", "")
     )
 
+    print_agent_output(
+        "AGENTIC FINAL SELECTION",
+        (
+            f"best_rank={final_state.get('best_rank', [])}\n"
+            f"test_strength={final_state.get('best_score', 0.0):.4f}\n"
+            f"mutation_score={final_state.get('best_mutation_score', 0.0):.4f}\n"
+            f"covered_mutants={final_state.get('best_covered_mutants', 0)}\n"
+            f"prediction:\n{best_prediction}"
+        ),
+        max_lines=100,
+        max_chars=10000
+    )
+
     return {
         "prediction": best_prediction,
 
         "mutation_score": final_state.get(
-            "mutation_score",
+            "best_mutation_score",
             0.0
         ),
 

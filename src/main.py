@@ -546,6 +546,13 @@ def run_evaluation(config, json_files, limit=None):
                     parent_focal_class
                 )
 
+                dp["_testClass"] = (
+                    project_obj.get(
+                        "testClass",
+                        {}
+                    )
+                )
+
                 state = {
                     "raw_datapoint": dp,
                     "run_mode": config[
@@ -561,7 +568,7 @@ def run_evaluation(config, json_files, limit=None):
                         "loop"
                     ],
                     "iteration": 0,
-                    "max_iterations": 3,
+                    "max_iterations": 4,
                     "feedback_history": [],
                     "best_score": 0.0,
                     "mutation_score": None,
